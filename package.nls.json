@@ -1,0 +1,7 @@
+{
+  "extension.description": "Manage VS Code BYOK models, API keys and backups.",
+  "trust.description": "Use a trusted window to edit user-level model configuration.",
+  "command.open": "Open Model Manager",
+  "command.restore": "Restore Model Configuration",
+  "command.diagnose": "Show Compatibility Diagnostics"
+}

@@ -1,0 +1,15 @@
+.git/**
+.github/**
+.vscode/**
+.vscode-test/**
+test/**
+scripts/**
+dist/**
+node_modules/**
+TESTING.md
+RELEASE.md
+.gitignore
+.vscodeignore
+*.vsix
+*.zip
+*.log

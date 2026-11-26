@@ -1,0 +1,66 @@
+{
+  "name": "byok-manager",
+  "displayName": "BYOK Manager",
+  "description": "%extension.description%",
+  "version": "0.5.0",
+  "publisher": "asong-local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.122.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "BYOK",
+    "customendpoint",
+    "configuration",
+    "models",
+    "copilot",
+    "language models"
+  ],
+  "main": "./src/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "%trust.description%"
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "byokManager.open",
+        "title": "%command.open%",
+        "category": "BYOK"
+      },
+      {
+        "command": "byokManager.restore",
+        "title": "%command.restore%",
+        "category": "BYOK"
+      },
+      {
+        "command": "byokManager.diagnose",
+        "title": "%command.diagnose%",
+        "category": "BYOK"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/extension.js && node --check src/core.js && node --check src/jsonc.js && node --check media/app.js && node --check src/i18n.js && node --check scripts/package.js && node --check scripts/release.js",
+    "package": "node scripts/package.js",
+    "package:marketplace": "node scripts/release.js package",
+    "publish:marketplace": "node scripts/release.js publish"
+  },
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#287b64",
+    "theme": "dark"
+  }
+}

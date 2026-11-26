@@ -1,0 +1,7 @@
+{
+  "extension.description": "可视化管理 VS Code BYOK 模型、API Key 和配置备份。",
+  "trust.description": "修改用户级模型配置前，请在可信窗口中使用。",
+  "command.open": "打开模型管理器",
+  "command.restore": "恢复模型配置备份",
+  "command.diagnose": "查看本机兼容性诊断"
+}
