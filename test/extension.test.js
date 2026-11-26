@@ -5,7 +5,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL, fileURLToPath } = require('node:url');
-const { ByokTool } = require('../src/extension');
+const { activate, ByokTool } = require('../src/extension');
+const pkg = require('../package.json');
 const { parseGroups } = require('../src/jsonc');
 const core = require('../src/core');
 
@@ -29,7 +30,7 @@ class Uri {
   static joinPath(uri, ...parts) { return new Uri(path.join(uri.fsPath, ...parts)); }
   toString() { return pathToFileURL(this.fsPath).href; }
 }
-async function harness(t, initial = '[]') {
+async function harness(t, initial = '[]', edition) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'byok-manager-test-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const uri = Uri.file(path.join(dir, 'profile-special', 'chatLanguageModels.json'));
@@ -44,8 +45,8 @@ async function harness(t, initial = '[]') {
     extensions: { all: [{ id: 'GitHub.copilot', packageJSON: { version: 'test', contributes: { languageModelChatProviders: [{ vendor: 'customendpoint', configuration: { properties: { apiKey: { secret: true }, models: { items: { properties: { statefulResponses: {} } } } } } }] } } }] },
     commands: {
       async getCommands() { return [OPEN, ADD, 'workbench.action.chat.manage']; },
-      async executeCommand(name, payload) {
-        state.commands.push({ name, payload });
+      async executeCommand(name, payload, ...args) {
+        state.commands.push({ name, payload, args });
         if (name === OPEN) { v.window.activeTextEditor = { document: doc }; return; }
         if (name === ADD) {
           const groups = parseGroups(state.text).value;
@@ -79,8 +80,8 @@ async function harness(t, initial = '[]') {
       async showTextDocument(document) { state.diagnostic = document.getText(); }
     }
   };
-  const context = { globalStorageUri: Uri.file(path.join(dir, 'storage')), extensionUri: Uri.file(path.resolve('.')), extensionPath: path.resolve('.'), subscriptions: [] };
-  const tool = new ByokTool(v, context);
+  const context = { globalStorageUri: Uri.file(path.join(dir, 'globalStorage', `${pkg.publisher}.${pkg.name}`)), extensionUri: Uri.file(path.resolve('.')), extensionPath: path.resolve('.'), subscriptions: [] };
+  const tool = new ByokTool(v, context, edition);
   tool.panel = { webview: { async postMessage(m) { state.posts.push(m); return true; } }, reveal() {} };
   async function backups() {
     const root = path.join(context.globalStorageUri.fsPath, 'backups');
@@ -91,6 +92,62 @@ async function harness(t, initial = '[]') {
   return { tool, v, state, dir, uri, backups, external };
 }
 
+function activateSidebar(h, language, edition, activateExtension = activate) {
+  const { v, state } = h;
+  const commands = new Map(), views = new Map(), panels = [];
+  v.env.language = language;
+  v.commands.registerCommand = (id, action) => { commands.set(id, action); return { dispose: () => commands.delete(id) }; };
+  v.window.registerTreeDataProvider = (id, provider) => { views.set(id, provider); return { dispose: () => views.delete(id) }; };
+  v.TreeItem = class { constructor(label, collapsibleState) { Object.assign(this, { label, collapsibleState }); } };
+  v.TreeItemCollapsibleState = { None: 0 }; v.ThemeIcon = class { constructor(id) { this.id = id; } };
+  v.ViewColumn = { One: 1 };
+  v.window.showInformationMessage = message => { state.lastInfo = message; };
+  v.window.createWebviewPanel = (id, title) => {
+    let onDispose;
+    const panel = { id, title, webview: { ...h.tool.panel.webview, asWebviewUri: u => u, cspSource: 'test', onDidReceiveMessage: () => ({ dispose() {} }) },
+      reveals: 0, reveal() { this.reveals++; }, onDidDispose(fn) { onDispose = fn; return { dispose() {} }; },
+      dispose() { this.disposed = true; onDispose(); } };
+    panels.push(panel); return panel;
+  };
+  const context = h.tool.context;
+  context.extension = { id: 'marketplace-test.byok-manager' };
+  activateExtension(context, v, edition);
+  return { commands, views, panels, dispose: () => context.subscriptions.forEach(s => s.dispose()) };
+}
+for (const language of ['en', 'zh-cn']) test(`sidebar (${language}): native actions reuse commands and the live panel`, async t => {
+  const h = await harness(t); const sidebar = activateSidebar(h, language);
+  const [container] = pkg.contributes.viewsContainers.activitybar;
+  const provider = sidebar.views.get(pkg.contributes.views[container.id][0].id);
+  const roots = await provider.getChildren();
+  const items = await Promise.all(roots.map(root => provider.getTreeItem(root)));
+  const ids = ['byokManager.open', 'byokManager.diagnose', 'byokManager.restore', 'byokManager.openGuide'];
+  const locale = language === 'en' ? require('../package.nls.json') : require('../package.nls.zh-cn.json');
+  assert.deepEqual(items.map(item => item.command.command).sort(), ids.slice().sort());
+  for (const [index, item] of items.entries()) {
+    assert.equal(item.label, locale['command.' + item.command.command.split('.')[1]]);
+    assert.deepEqual(await provider.getChildren(roots[index]), []);
+  }
+  assert.equal(sidebar.panels.length, 0); assert.equal(h.state.commands.length, 0);
+  await sidebar.commands.get('byokManager.openGuide')();
+  assert.equal(sidebar.panels.length, 0); assert.equal(h.state.dialogs.length, 0);
+  assert.deepEqual(h.state.commands.map(c => [c.name, c.payload]), [['workbench.action.openWalkthrough', 'marketplace-test.byok-manager#userGuide']]);
+  const open = sidebar.commands.get(ids[0]); await Promise.all([open(), open()]);
+  assert.equal(sidebar.panels.length, 1); assert.equal(sidebar.panels[0].reveals, 1);
+  assert.match(sidebar.panels[0].webview.html, language === 'en' ? /lang="en"/ : /lang="zh-CN"/);
+  sidebar.panels[0].dispose(); await open(); assert.equal(sidebar.panels.length, 2);
+  await sidebar.commands.get(ids[1])(); assert.ok(h.state.diagnostic.includes(pkg.version));
+  sidebar.dispose(); assert.ok(sidebar.panels[1].disposed); assert.equal(sidebar.views.size, 0); assert.equal(sidebar.commands.size, 0);
+});
+test('sidebar: restore posts busy state and reports success when no panel exists', async t => {
+  const h = await harness(t); await h.tool.apply(form({ noAuth: true }));
+  const sidebar = activateSidebar(h, 'en'); const restore = sidebar.commands.get('byokManager.restore');
+  await restore(); assert.equal(sidebar.panels.length, 0); assert.match(h.state.lastInfo, /restored/i);
+  await sidebar.commands.get('byokManager.open')(); h.state.posts.length = 0;
+  h.state.cancel = true; h.state.beforeConfirm = () => assert.equal(h.state.posts.findLast(p => p.type === 'busy')?.value, true);
+  await restore(); assert.equal(h.state.lastError, undefined);
+  assert.deepEqual(h.state.posts.filter(p => p.type === 'busy').map(p => p.value), [true, false]);
+  sidebar.dispose();
+});
 test('host: current Profile resolved through native command, not guessed paths', async t => {
   const h = await harness(t); const result = await h.tool.readConfig();
   assert.equal(result.uri.toString(), h.uri.toString()); assert.equal(h.state.commands[0].name, OPEN);
@@ -106,6 +163,30 @@ test('host: new key native save, profile write, durable backup, no plaintext in 
   const backups = await h.backups(); assert.equal(backups.length, 1); assert.equal(backups[0].text, initial); assert.equal(backups[0].meta.status, 'complete');
   const combined = h.state.text + JSON.stringify(backups) + JSON.stringify(h.state.posts) + JSON.stringify(h.state.dialogs);
   assert.equal(combined.includes('test-private-key-12345'), false);
+});
+test('walkthrough: only a confirmed, successful configuration write signals completion', async t => {
+  const h = await harness(t);
+  const signals = () => h.state.commands.filter(c => c.name === 'setContext');
+  h.state.inputValue = 'local-test-key'; await h.tool.setKey();
+  await h.tool.handle({ type: 'validate', form: form() });
+  h.state.cancel = true; await h.tool.apply(form());
+  assert.deepEqual(signals(), []);
+  h.state.cancel = false; h.v.workspace.applyEdit = async () => false;
+  await assert.rejects(h.tool.apply(form({ noAuth: true })));
+  assert.deepEqual(signals(), []);
+  const success = await harness(t); success.tool.pendingKey = 'local-test-key';
+  await success.tool.apply(form());
+  assert.deepEqual(success.state.commands.filter(c => c.name === 'setContext'), [
+    { name: 'setContext', payload: 'byokManager.configurationSaved', args: [true] }
+  ]);
+});
+test('walkthrough: a panel refresh failure does not undo a committed backup or progress', async t => {
+  const h = await harness(t);
+  h.tool.refresh = async () => { throw new Error('Panel closed'); };
+  await h.tool.apply(form({ noAuth: true }));
+  assert.equal((await h.backups())[0].meta.status, 'complete');
+  assert.equal(h.state.commands.filter(c => c.name === 'setContext').length, 1);
+  assert.equal(h.state.posts.at(-1).kind, 'warning');
 });
 test('host: repeated update reuses secret and preserves one provider group', async t => {
   const h = await harness(t); h.tool.pendingKey = 'test-private-key'; await h.tool.apply(form());
@@ -183,6 +264,71 @@ test('host: same-tool concurrent lock is not overridden', async t => {
   const first = h.tool.withLock(async () => { await assert.rejects(h.tool.withLock(async () => {}), /另一个窗口/); release(); });
   await Promise.all([first, gate]); await h.tool.withLock(async () => {});
 });
+function expectedLocks(tool) {
+  const name = 'write-' + core.digest(tool.configUri.toString()).slice(0, 20) + '.lock';
+  const storage = tool.context.globalStorageUri.fsPath;
+  return { shared: path.join(path.dirname(storage), '.byok-' + name), legacy: path.join(storage, name) };
+}
+for (const holder of ['public', 'enterprise']) test(`profile lock: ${holder} excludes the other edition from applying and restoring`, async t => {
+  const h = await harness(t);
+  const edition = sampleEdition();
+  const enterprise = new ByokTool(h.v, { ...h.tool.context,
+    globalStorageUri: Uri.file(path.join(h.dir, 'globalStorage', `${edition.publisher}.${edition.name}`)) }, edition);
+  const [owner, other] = holder === 'public' ? [h.tool, enterprise] : [enterprise, h.tool];
+  await other.apply(form({ noAuth: true })); // Give the contender a real backup to restore.
+  await owner.readConfig();
+  const before = h.state.text, root = path.join(other.context.globalStorageUri.fsPath, 'backups');
+  const backups = await fs.readdir(root);
+  await owner.withLock(async () => {
+    await assert.rejects(other.apply(form({ noAuth: true, name: 'second' })), /另一个窗口/);
+    await assert.rejects(other.restore(), /另一个窗口/);
+    assert.equal(h.state.text, before); assert.deepEqual(await fs.readdir(root), backups);
+    for (const file of Object.values(expectedLocks(owner))) assert.equal(await fs.readFile(file, 'utf8'), String(process.pid));
+    await assert.rejects(fs.stat(expectedLocks(other).legacy), { code: 'ENOENT' });
+  });
+  other.panel = h.tool.panel;
+  await other.restore(); assert.equal(h.state.text, '[]');
+});
+test('profile lock: old writer blocks new writer without losing the old lock or leaking the shared lock', async t => {
+  const h = await harness(t); await h.tool.readConfig();
+  const { shared, legacy } = expectedLocks(h.tool);
+  await h.v.workspace.fs.createDirectory(h.tool.context.globalStorageUri);
+  await fs.writeFile(legacy, '123');
+  await assert.rejects(h.tool.withLock(() => assert.fail()), e => e.message.includes(legacy));
+  assert.equal(await fs.readFile(legacy, 'utf8'), '123');
+  await assert.rejects(fs.stat(shared), { code: 'ENOENT' });
+  await fs.unlink(legacy);
+  await assert.rejects(h.tool.withLock(async () => {
+    await assert.rejects(fs.open(legacy, 'wx', 0o600), { code: 'EEXIST' });
+    throw Error('operation failed');
+  }), /operation failed/);
+  for (const file of [legacy, shared]) await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+});
+for (const language of ['en', 'zh-cn']) test(`profile lock: stale shared lock is preserved and paths are diagnosed (${language})`, async t => {
+  const h = await harness(t); h.v.env.language = language;
+  const tool = new ByokTool(h.v, h.tool.context); await tool.readConfig();
+  const { legacy, shared } = expectedLocks(tool);
+  await fs.mkdir(path.dirname(shared), { recursive: true }); await fs.writeFile(shared, '0');
+  await assert.rejects(tool.apply(form({ noAuth: true })), e => e.message.includes(shared) && (language === 'en' ? /stale/i : /锁/).test(e.message));
+  assert.equal(await fs.readFile(shared, 'utf8'), '0');
+  await assert.rejects(fs.stat(legacy), { code: 'ENOENT' });
+  await new ByokTool(h.v, h.tool.context).diagnose(); // Also works as a standalone command after restart.
+  assert.ok(h.state.diagnostic.includes(shared)); assert.ok(h.state.diagnostic.includes(legacy));
+  assert.match(h.state.diagnostic, language === 'en' ? /shared profile lock/i : /共享锁/);
+  assert.equal(h.state.text, '[]'); assert.deepEqual(await h.backups(), []);
+});
+test('profile lock: a writer does not block another profile using the same storage root', async t => {
+  const a = await harness(t), b = await harness(t);
+  b.tool.context.globalStorageUri = a.tool.context.globalStorageUri;
+  await a.tool.readConfig();
+  await a.tool.withLock(() => b.tool.apply(form({ noAuth: true })));
+  assert.equal(a.state.text, '[]'); assert.equal(parseGroups(b.state.text).value.length, 1);
+});
+test('profile lock: unexpected storage parent fails closed before touching it', async t => {
+  const h = await harness(t); h.tool.context.globalStorageUri = Uri.file(path.join(h.dir, 'unexpected', 'edition'));
+  await assert.rejects(h.tool.apply(form({ noAuth: true })), /globalStorage/);
+  await assert.rejects(fs.stat(path.join(h.dir, 'unexpected')), { code: 'ENOENT' });
+});
 test('host: key input is native masked, not passed to webview; diagnostics omit it', async t => {
   const h = await harness(t); h.state.inputValue = 'test-sensitive-value'; await h.tool.setKey();
   assert.equal(h.state.inputOptions.password, true); assert.equal(h.tool.pendingKey, h.state.inputValue);
@@ -199,6 +345,156 @@ test('host: mutation handler always releases busy flag and masks pending key err
 
 const preset = {name:'custom',vendor:'customendpoint',apiType:'chat-completions',models:[{...sampleModel(),id:'first-model',name:'First model'}]};
 const lastDraft = h => h.state.posts.filter(p => p.type === 'state').at(-1).draft;
+
+test('host: explicit refresh does not replace a draft, baseline, or pending key on read failure', async t => {
+  const h = await harness(t, JSON.stringify([preset]));
+  await h.tool.refresh();
+  const baseline = h.tool.baseline, template = h.tool.template;
+  h.tool.pendingKey = 'pending-fixture'; h.state.posts.length = 0; h.state.dirty = true;
+  await h.tool.handle({ type: 'refresh', name: preset.name });
+  assert.equal(h.tool.baseline, baseline); assert.equal(h.tool.template, template);
+  assert.equal(h.tool.pendingKey, 'pending-fixture');
+  assert.equal(h.state.posts.some(m => m.type === 'state'), false);
+  assert.ok(h.state.posts.some(m => m.type === 'notice' && m.kind === 'error'));
+  assert.equal(JSON.stringify(h.state.posts).includes('pending-fixture'), false);
+  h.state.dirty = false;
+  await h.tool.handle({ type: 'refresh', name: preset.name });
+  assert.equal(h.tool.pendingKey, undefined);
+  assert.equal(h.state.posts.findLast(m => m.type === 'state').hasPendingKey, false);
+});
+
+for (const failure of ['reject', 'not delivered']) {
+  test(`host: explicit refresh retains its host draft when replacement state is ${failure}`, async t => {
+    const h = await harness(t, JSON.stringify([preset, { ...preset, name: 'other' }]));
+    await h.tool.refresh(); h.tool.pendingKey = 'pending-fixture';
+    const baseline = h.tool.baseline, template = h.tool.template, deliver = h.tool.panel.webview.postMessage;
+    h.tool.panel.webview.postMessage = async m => {
+      if (m.type !== 'state') return deliver(m);
+      if (failure === 'reject') throw new Error('Panel delivery failed');
+      return false;
+    };
+    await h.tool.handle({ type: 'refresh', name: 'other' });
+    assert.equal(h.tool.baseline, baseline); assert.equal(h.tool.template, template);
+    assert.equal(h.tool.pendingKey, 'pending-fixture');
+  });
+}
+
+test('host: explicitly reloading a vanished group preserves the last loaded group', async t => {
+  const h = await harness(t, JSON.stringify([preset]));
+  await h.tool.refresh(); h.tool.pendingKey = 'pending-fixture';
+  await h.external('[]'); h.state.posts.length = 0;
+  await h.tool.handle({ type: 'refresh', name: preset.name });
+  assert.equal(h.tool.baseline?.name, preset.name);
+  assert.equal(h.tool.pendingKey, 'pending-fixture');
+  assert.equal(h.state.posts.some(m => m.type === 'state'), false);
+  assert.ok(h.state.posts.some(m => m.type === 'notice' && m.kind === 'error'));
+});
+
+test('host: rejected initial busy delivery does not strand subsequent operations', async t => {
+  const h = await harness(t), deliver = h.tool.panel.webview.postMessage;
+  h.tool.panel.webview.postMessage = async m => {
+    if (m.type === 'busy' && m.value) throw new Error('Panel delivery failed');
+    return deliver(m);
+  };
+  await h.tool.handle({ type: 'format', modelsText: '[]' }).catch(() => {});
+  assert.equal(h.tool.busy, false);
+  assert.deepEqual(h.state.posts.at(-1), { type: 'busy', value: false });
+  assert.ok(!h.state.posts.some(m => m.type === 'models'));
+  h.tool.panel.webview.postMessage = deliver;
+  await h.tool.handle({ type: 'format', modelsText: '[]' });
+  assert.ok(h.state.posts.some(m => m.type === 'models'));
+});
+
+test('host: save failure unlocks while the non-modal error notification is still visible', async t => {
+  const h = await harness(t);
+  let shown, dismiss;
+  const visible = new Promise(resolve => { shown = resolve; });
+  h.v.window.showErrorMessage = () => { shown(); return new Promise(resolve => { dismiss = resolve; }); };
+  h.tool.apply = async () => { throw new Error('Invalid draft'); };
+  const saving = h.tool.handle({ type: 'apply', form: form() });
+  try {
+    await visible; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.tool.busy, false);
+    assert.deepEqual(h.state.posts.at(-1), { type: 'busy', value: false });
+    assert.ok(h.state.posts.some(m => m.kind === 'error' && m.text === 'Invalid draft'));
+  } finally { dismiss(); await saving; }
+});
+const sampleEdition = () => ({ edition: 'sample', publisher: 'sample', name: 'sample-manager', displayName: 'Sample Manager',
+  preset, auxiliaryModel: preset.models[0].id, settings: [{ key: HOST, value: false }], aliases: { 'legacySample.open': 'byokManager.open' },
+  features: { presetButton: true }, locales: { en: {}, 'zh-cn': {} } });
+test('edition: a fresh profile loads a cloned default, but a saved group takes priority', async t => {
+  const edition = sampleEdition(), h = await harness(t, '[]', edition);
+  await h.tool.refresh(); assert.deepEqual(JSON.parse(lastDraft(h).modelsText), preset.models);
+  assert.equal(lastDraft(h).auxiliaryModel, edition.auxiliaryModel); assert.notEqual(h.tool.template.models, preset.models);
+  await h.external(JSON.stringify([{ ...preset, name: 'local' }])); await h.tool.refresh();
+  assert.equal(lastDraft(h).name, 'local'); assert.equal(lastDraft(h).auxiliaryModel, '');
+  await h.tool.apply(form({ name: 'local', noAuth: true, applyRecommendedSettings: true }));
+  assert.deepEqual([...h.state.settings], [[HOST, false]]);
+});
+test('edition: loading requires confirmation, retains pending key and tracks the existing group for conflicts', async t => {
+  const stored = { ...preset, apiKey: '${input:chat.lm.secret.sample}', models: [sampleModel()] };
+  const initial = JSON.stringify([stored]); const h = await harness(t, initial, sampleEdition());
+  await h.tool.refresh(); h.tool.pendingKey = 'pending-sample'; h.state.cancel = true;
+  await h.tool.handle({ type: 'editionPreset' }); assert.equal(h.state.dialogs.length, 1);
+  assert.deepEqual(JSON.parse(lastDraft(h).modelsText), stored.models);
+  h.state.cancel = false; await h.tool.handle({ type: 'editionPreset' });
+  assert.deepEqual(JSON.parse(lastDraft(h).modelsText), preset.models); assert.equal(h.tool.pendingKey, 'pending-sample');
+  assert.equal(h.state.text, initial); assert.equal((await h.backups()).length, 0); assert.equal(h.state.secrets.size, 0);
+  assert.ok(!JSON.stringify(h.state.posts).includes('pending-sample'));
+  await h.external(JSON.stringify([{ ...stored, models: [] }])); await assert.rejects(h.tool.apply(lastDraft(h)), /已被修改/);
+});
+test('edition: an upgraded installation restores a format-1 backup in its existing storage without copying keys', async t => {
+  const h = await harness(t, '[]', sampleEdition());
+  const original = JSON.stringify([{ ...preset, apiKey: '${input:chat.lm.secret.old}' }]);
+  const historic = path.join(h.tool.context.globalStorageUri.fsPath, 'backups', 'historic');
+  await fs.mkdir(historic, { recursive: true });
+  await fs.writeFile(path.join(historic, 'config.jsonc'), original);
+  await fs.writeFile(path.join(historic, 'meta.json'), JSON.stringify({ format: 1, created: '2026-01-01',
+    reason: 'apply', status: 'complete', configUri: h.uri.toString(), beforeHash: core.digest(original),
+    settingsBefore: [{ key: HOST, hadValue: false }], settingsApplied: [{ key: HOST, value: false }] }));
+  h.state.settings.set(HOST, false); await h.tool.restore();
+  assert.equal(h.state.text, original); assert.equal(h.state.settings.has(HOST), false);
+  assert.equal(h.state.commands.some(c => c.name === ADD), false);
+  assert.deepEqual((await h.backups()).map(b => b.meta.reason).sort(), ['apply', 'before-restore']);
+});
+test('edition: public runtime ignores forged preset request', async t => {
+  const h = await harness(t); await h.tool.handle({ type: 'editionPreset', preset });
+  assert.equal(h.state.dialogs.length, 0); assert.equal(h.state.posts.some(p => p.type === 'state'), false);
+});
+test('edition: legacy commands run the same manager without a duplicate panel', async t => {
+  const h = await harness(t), sidebar = activateSidebar(h, 'en', sampleEdition());
+  await sidebar.commands.get('legacySample.open')(); await sidebar.commands.get('byokManager.open')();
+  assert.equal(sidebar.panels.length, 1); assert.equal(sidebar.panels[0].reveals, 1);
+  assert.equal(sidebar.panels[0].title, 'Sample Manager'); sidebar.dispose();
+});
+test('edition stages can coexist: manifests, runtime registrations and walkthrough links use the same distinct IDs', async t => {
+  const { withStage } = require('../scripts/build');
+  const fixture = { ...require('../editions/enterprise.example.json'), publisher: 'fixture-org', name: 'fixture-manager' };
+  const h = await harness(t), configPath = path.join(h.dir, 'fixture.json');
+  await fs.writeFile(configPath, JSON.stringify(fixture));
+  await withStage('enterprise', async ({ stage, pkg: staged }) => {
+    const entry = require(path.join(stage, 'src', 'extension.js'));
+    const [container] = staged.contributes.viewsContainers.activitybar;
+    assert.notEqual(container.id, pkg.contributes.viewsContainers.activitybar[0].id);
+    const stagedIds = staged.contributes.commands.map(c => c.command);
+    const publicIds = pkg.contributes.commands.map(c => c.command);
+    assert.ok(stagedIds.every(id => !publicIds.includes(id)));
+    const [view] = staged.contributes.views[container.id]; assert.notEqual(view.id, 'byokManager.actions');
+    h.tool.context.extensionPath = stage; h.tool.context.extensionUri = Uri.file(stage);
+    const sidebar = activateSidebar(h, 'en', undefined, entry.activate);
+    assert.ok(sidebar.views.has(view.id));
+    assert.ok(stagedIds.every(id => sidebar.commands.has(id)));
+    await sidebar.commands.get(Object.keys(fixture.aliases)[0])();
+    assert.notEqual(sidebar.panels[0].id, 'byokManager');
+    assert.match(sidebar.panels[0].webview.html, /id="loadEditionPreset"/);
+    for (const lang of ['package.nls.json', 'package.nls.zh-cn.json']) {
+      const labels = require(path.join(stage, lang));
+      for (const value of Object.values(labels)) for (const [,id] of value.matchAll(/\(command:([\w.]+)\)/g)) assert.ok(sidebar.commands.has(id), id);
+    }
+    sidebar.dispose();
+  }, { configPath, expectedEnterpriseId: `${fixture.publisher}.${fixture.name}` });
+});
+
 test('host: first open shows a blank generic group and never writes', async t => {
   const h=await harness(t); await h.tool.refresh(); const draft=lastDraft(h);
   assert.equal(draft.name,'custom'); assert.equal(draft.apiType,'chat-completions'); assert.equal(draft.defaultUrl,'');

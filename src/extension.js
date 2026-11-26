@@ -5,27 +5,18 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parseDocument, parseGroups } = require('./jsonc');
 const core = require('./core');
-const defaultPreset = () => ({ name: 'custom', vendor: core.VENDOR, apiType: 'chat-completions', models: [] });
+const checkoutEdition = require('../editions/public.json');
+const blankGroup = () => ({ name: 'custom', vendor: core.VENDOR, apiType: 'chat-completions', models: [] });
 const OPEN_JSON = 'workbench.action.openLanguageModelsJson';
 const ADD_GROUP = 'lm.addLanguageModelsProviderGroup';
 const MANAGE = 'workbench.action.chat.manage';
-const SETTINGS = [
-  { formKey: 'enableAgentHost', key: 'chat.agentHost.byokModels.enabled', value: true },
-  { formKey: 'utilityMain', key: 'chat.byokUtilityModelDefault', value: 'mainAgent' },
-  { key: 'chat.requestQueuing.defaultAction', value: 'queue' },
-  { key: 'chat.planAgent.defaultModel', model: 'name' },
-  { key: 'inlineChat.defaultModel', model: 'name' },
-  { key: 'chat.utilityModel', model: 'id' },
-  { key: 'chat.utilitySmallModel', model: 'id' }
-];
-
-
 class ByokTool {
-  constructor(vscode, context) {
+  constructor(vscode, context, edition = checkoutEdition) {
+    this.edition = edition;
     setLocale(vscode.env.language);
     this.v = vscode; this.context = context; this.panel = undefined;
     this.configUri = undefined; this.pendingKey = undefined; this.busy = false;
-    this.template = defaultPreset();
+    this.template = blankGroup();
     this.baseline = undefined;
   }
   async environment() {
@@ -46,8 +37,8 @@ class ByokTool {
       manage: commands.has(MANAGE), provider: !!provider,
       providerExtension: provider ? provider.ext.id + ' ' + provider.ext.packageJSON.version : tr("未发现可用的官方 Custom Endpoint 配置声明", "No supported official Custom Endpoint configuration was found."),
       aiDisabled: config.get('chat.disableAIFeatures') === true,
-      agentHostSupported: config.inspect(SETTINGS[0].key) !== undefined,
-      utilitySupported: config.inspect(SETTINGS[1].key) !== undefined,
+      agentHostSupported: config.inspect('chat.agentHost.byokModels.enabled') !== undefined,
+      utilitySupported: config.inspect('chat.byokUtilityModelDefault') !== undefined,
       statelessSupported: !!provider?.entry.configuration?.properties?.models?.items?.properties?.statefulResponses,
       trusted: this.v.workspace.isTrusted,
       desktop: this.v.env.uiKind === this.v.UIKind.Desktop
@@ -59,7 +50,7 @@ class ByokTool {
     if (!env.trusted) throw new Error(tr("请在可信工作区或新的本地空窗口中使用。", "Use a trusted workspace or a new local empty window."));
     if (env.aiDisabled) throw new Error(tr("当前关闭了 AI 功能（chat.disableAIFeatures）。请先检查设置或组织策略，工具不会强行更改。", "AI features are disabled (chat.disableAIFeatures). Check settings or organization policy; this tool will not override them."));
     if (!env.openJson) throw new Error(tr("当前版本没有原生模型配置入口。请更新 VS Code 并启用官方 Copilot / Chat 功能。", "The native model configuration entry point is unavailable. Update VS Code and enable official Copilot / Chat features."));
-    if (!env.provider) throw new Error(tr("未找到已启用的官方 Custom Endpoint 密钥配置声明。请启用或更新官方 GitHub Copilot 扩展；不需要先登录 GitHub。", "No enabled official Custom Endpoint secret configuration found. Enable or update the official GitHub Copilot extension."));
+    if (!env.provider) throw new Error(tr("未找到已启用的官方 Custom Endpoint 密钥配置声明。请启用或更新官方 GitHub Copilot 扩展。", "No enabled official Custom Endpoint secret configuration found. Enable or update the official GitHub Copilot extension."));
     if (needsSecret && !env.addGroup) throw new Error(tr("当前版本没有经过核对的原生密钥写入命令。已停止；请在原生模型管理中录入 Key 后再复用。", "The native secret command is unavailable. Enter the key in native model management, then reuse it here."));
     return env;
   }
@@ -95,64 +86,90 @@ class ByokTool {
     if (!await this.v.workspace.applyEdit(edit)) throw new Error(tr("VS Code 拒绝应用配置修改。", "VS Code rejected the configuration edit."));
     if (!await current.doc.save()) throw new Error(tr("配置未能保存，可能只读或磁盘不可写。请查看当前文件和备份。", "Could not save the configuration. Check file permissions and the backup."));
   }
-  async post(message) { if (this.panel) await this.panel.webview.postMessage(message); }
+  async post(message) { return this.panel?.webview.postMessage(message); }
   async notice(text, kind = 'info') { await this.post({ type: 'notice', text, kind }); }
   async show() {
     if (this.panel) { this.panel.reveal(); return; }
-    this.panel = this.v.window.createWebviewPanel('byokManager', 'BYOK Manager', this.v.ViewColumn.One, {
+    this.panel = this.v.window.createWebviewPanel('byokManager', this.edition.displayName, this.v.ViewColumn.One, {
       enableScripts: true, retainContextWhenHidden: true,
       localResourceRoots: [this.v.Uri.joinPath(this.context.extensionUri, 'media')]
     });
     const panel = this.panel;
-    panel.onDidDispose(() => { this.pendingKey = undefined; this.panel = undefined; this.baseline = undefined; });
-    panel.webview.onDidReceiveMessage(message => this.handle(message));
-    panel.webview.html = await this.html(panel.webview);
+    const messages = panel.webview.onDidReceiveMessage(message => this.handle(message));
+    panel.onDidDispose(() => { messages.dispose(); this.pendingKey = undefined; this.panel = undefined; this.baseline = undefined; });
+    const html = await this.html(panel.webview);
+    if (this.panel === panel) panel.webview.html = html;
   }
   async html(webview) {
     const nonce = crypto.randomBytes(24).toString('base64');
     const template = await fs.readFile(path.join(this.context.extensionPath, 'media', isChinese() ? 'index.zh-cn.html' : 'index.html'), 'utf8');
-    const settingsJson = JSON.stringify(Object.fromEntries(SETTINGS.filter(s => !s.model).map(s => [s.key, s.value])), null, 2)
-      .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-    return template.replaceAll('{{RECOMMENDED_SETTINGS}}', settingsJson).replaceAll('{{CSP_SOURCE}}', webview.cspSource).replaceAll('{{NONCE}}', nonce)
+    const escapeText = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    const settingsJson = JSON.stringify(Object.fromEntries(this.edition.settings.filter(s => !s.model).map(s => [s.key, s.value])), null, 2);
+    return template.replaceAll('{{EDITION_DISPLAY_NAME}}', () => escapeText(this.edition.displayName))
+      .replaceAll('{{RECOMMENDED_SETTINGS}}', () => escapeText(settingsJson)).replaceAll('{{CSP_SOURCE}}', webview.cspSource).replaceAll('{{NONCE}}', nonce)
       .replaceAll('{{STYLE_URI}}', webview.asWebviewUri(this.v.Uri.joinPath(this.context.extensionUri, 'media', 'style.css')).toString())
       .replaceAll('{{SCRIPT_URI}}', webview.asWebviewUri(this.v.Uri.joinPath(this.context.extensionUri, 'media', 'app.js')).toString());
   }
-  async refresh(selection) {
+  async refresh(selection, draftKind, { explicitReload = false } = {}) {
     const env = await this.environment();
     let groups = []; let error;
     try { groups = parseGroups((await this.readConfig()).text).value; }
-    catch (e) { error = core.safeError(e); }
-    const custom = groups.filter(g => g.vendor === core.VENDOR && !g.name.startsWith(core.TEMP_PREFIX));
-    const chosen = selection === null ? undefined : selection === undefined ? custom[0] : custom.find(g => g.name === selection);
-    if (chosen) {
-      this.template = core.publicGroup(chosen); this.baseline = { name: chosen.name, group: core.clone(chosen) };
-    } else if (selection !== null) {
-      this.template = defaultPreset(); this.baseline = undefined;
+    catch (e) {
+      if (explicitReload || draftKind === 'preset') throw e;
+      error = core.safeError(e, [this.pendingKey]);
     }
-    const modelUrls = [...new Set((this.template.models || []).map(m => m.url).filter(Boolean))];
-    await this.post({ type: 'state', env,
+    const custom = groups.filter(g => g.vendor === core.VENDOR && !g.name.startsWith(core.TEMP_PREFIX));
+    const explicitPreset = draftKind === 'preset';
+    const chosen = explicitPreset ? custom.find(g => g.name === this.edition.preset.name)
+      : selection === null ? undefined : selection === undefined ? custom.find(g => g.name === this.edition.preset?.name) || custom[0]
+      : custom.find(g => g.name === selection);
+    if (explicitReload && selection !== undefined && !chosen) throw new Error(tr('模型组已不存在。可选择其他模型组或新建。', 'The model group no longer exists. Select another group or create a new one.'));
+    const usePreset = explicitPreset || (!error && !chosen && selection === undefined && !!this.edition.preset);
+    let template = this.template, baseline = this.baseline;
+    if (usePreset || chosen || selection !== null) {
+      template = usePreset ? core.sanitizePreset(this.edition.preset) : chosen ? core.publicGroup(chosen) : blankGroup();
+      baseline = chosen ? { name: chosen.name, group: core.clone(chosen) } : undefined;
+    }
+    const modelUrls = [...new Set((template.models || []).map(m => m.url).filter(Boolean))];
+    const panel = this.panel;
+    const delivered = await this.post({ type: 'state', env, draftKind: draftKind || (usePreset ? 'preset' : chosen ? 'existing' : 'new'),
       groups: custom.map(g => ({ name: g.name, count: Array.isArray(g.models) ? g.models.length : 0, hasKey: core.isSecretRef(g.apiKey) })),
-      draft: { name: this.template.name || 'custom', apiType: this.template.apiType || 'chat-completions',
-        defaultUrl: modelUrls.length === 1 ? modelUrls[0] : '',
-        modelsText: JSON.stringify(this.template.models || [], null, 2) },
-      selected: this.baseline?.name || '', configPath: this.configUri?.toString(true) || tr("尚未定位", "Not located"),
-      hasPendingKey: !!this.pendingKey, error
+      draft: { name: template.name || 'custom', apiType: template.apiType || 'chat-completions',
+        defaultUrl: usePreset && template.url ? template.url : modelUrls.length === 1 ? modelUrls[0] : '',
+        auxiliaryModel: usePreset && template.models.some(m => m.id === this.edition.auxiliaryModel) ? this.edition.auxiliaryModel : '',
+        modelsText: JSON.stringify(template.models || [], null, 2) },
+      selected: baseline?.name || '', configPath: this.configUri?.toString(true) || tr("尚未定位", "Not located"),
+      hasPendingKey: !explicitReload && !!this.pendingKey, error
     });
-    if (this.panel) this.panel.reveal(undefined, true);
+    if (delivered === false || panel !== this.panel) return;
+    this.template = template; this.baseline = baseline;
+    if (explicitReload) this.pendingKey = undefined;
+    if (panel) panel.reveal(undefined, true);
   }
   async handle(message) {
     if (!message || typeof message.type !== 'string') return;
     if (this.busy) return;
-    this.busy = true; await this.post({ type: 'busy', value: true });
+    this.busy = true;
     try {
+      const delivered = await this.post({ type: 'busy', value: true, operation: message.type });
+      if (delivered === false) return;
       switch (message.type) {
         case 'ready': await this.refresh(); break;
-        case 'refresh': this.pendingKey = undefined; await this.refresh(message.name === null ? undefined : message.name); break;
+        case 'refresh': await this.refresh(message.name ?? undefined, undefined, { explicitReload: true }); break;
+        case 'editionPreset': {
+          if (!this.edition.features.presetButton || !this.edition.preset) break;
+          const load = this.edition.locales[isChinese() ? 'zh-cn' : 'en']['edition.loadPreset'] || tr('加载预设', 'Load Preset');
+          const answer = await this.v.window.showWarningMessage(tr('替换当前草稿？', 'Replace the current draft?'), {
+            modal: true, detail: tr('加载预设会替换尚未保存的表单内容。暂存的 API Key 将保留。本机配置不会更改。', 'Loading the preset replaces unsaved form edits. The pending API key will be kept. Local configuration will not change.')
+          }, load);
+          if (answer === load) await this.refresh(null, 'preset');
+          break;
+        }
         case 'new': {
           const answer = await this.v.window.showWarningMessage(tr("新建模型组？", "Create a model group?"), { modal: true, detail: tr("当前未保存的草稿与暂存密钥将被清除，不会修改本机配置。", "Unsaved changes and the pending key will be discarded. No local configuration will be changed.") }, tr("新建", "New"));
           if (!answer) break;
           this.pendingKey = undefined; this.baseline = undefined;
-          this.template = defaultPreset();
+          this.template = blankGroup();
           await this.refresh(null); break;
         }
         case 'setKey': await this.setKey(); break;
@@ -188,7 +205,7 @@ class ByokTool {
     } catch (e) {
       const message = core.safeError(e, [this.pendingKey]);
       await this.notice(message, 'error');
-      await this.v.window.showErrorMessage('BYOK：' + message);
+      void this.v.window.showErrorMessage('BYOK：' + message);
     } finally {
       this.busy = false; await this.post({ type: 'busy', value: false });
     }
@@ -214,7 +231,7 @@ class ByokTool {
       if (!selected) return; chosen = candidates[selected.index];
     }
     this.template = chosen; this.baseline = undefined; this.pendingKey = undefined;
-    await this.refresh(null);
+    await this.refresh(null, 'import');
     await this.notice(tr("已载入预设，尚未写入。导入已移除 API Key、密钥引用及全部 requestHeaders；同机同名组可在写入时复用已有 Key。", "Preset loaded, not saved. API keys, references and requestHeaders were removed. An existing key for the same group can be reused when saving."), 'warning');
   }
   async exportFile(form) {
@@ -257,20 +274,32 @@ class ByokTool {
   async saveMeta(backup) {
     await this.v.workspace.fs.writeFile(this.v.Uri.joinPath(backup.folder, 'meta.json'), Buffer.from(JSON.stringify(backup.meta, null, 2), 'utf8'));
   }
-  async withLock(operation) {
-    // Locks only other copies of this tool, not arbitrary editors. File/text
-    // equality guards below additionally detect ordinary concurrent edits.
-    await this.v.workspace.fs.createDirectory(this.context.globalStorageUri);
+  lockPaths() {
+    const storage = this.context.globalStorageUri;
+    const parent = path.dirname(storage.fsPath);
+    if (!['file', 'vscode-userdata'].includes(storage.scheme) || !path.isAbsolute(storage.fsPath) || path.basename(parent).toLowerCase() !== 'globalstorage') {
+      throw new Error(tr('无法确认本机 Profile 的 globalStorage 目录，已停止写入。', 'Could not verify the local profile globalStorage directory. No write was attempted.'));
+    }
     const name = 'write-' + core.digest(this.configUri.toString()).slice(0, 20) + '.lock';
-    const lockPath = path.join(this.context.globalStorageUri.fsPath, name);
+    return { shared: path.join(parent, '.byok-' + name), legacy: path.join(storage.fsPath, name) };
+  }
+  async withLock(operation) {
+    const { shared, legacy } = this.lockPaths();
+    await this.v.workspace.fs.createDirectory(this.context.globalStorageUri);
+    // Different editions share the outer lock; older releases only know the inner one.
+    return this.withFileLock(shared, () => this.withFileLock(legacy, operation));
+  }
+  async withFileLock(lockPath, operation) {
     let handle;
     try { handle = await fs.open(lockPath, 'wx', 0o600); }
     catch (e) {
-      if (e.code === 'EEXIST') throw new Error(tr("另一个窗口正在写入，或上次异常退出留下了锁。确认其他窗口没有操作后，删除诊断中显示的 write-*.lock 文件再重试。", "Another window is writing, or a stale lock remains. After confirming no other window is writing, remove the write-*.lock file shown in diagnostics and retry."));
+      if (e.code === 'EEXIST') throw new Error(tr('另一个窗口正在写入，或上次异常退出留下了锁。请确认所有窗口均未写入后，再删除此锁文件并重试：', 'Another window is writing, or a stale lock remains. Confirm no window is writing before removing this lock file and retrying: ') + lockPath);
       throw e;
     }
     try { await handle.writeFile(String(process.pid)); return await operation(); }
-    finally { await handle.close(); await fs.unlink(lockPath).catch(() => {}); }
+    finally {
+      try { await handle.close(); } finally { await fs.unlink(lockPath); }
+    }
   }
   async apply(form) {
     const env = await this.ensureCompatible(!!this.pendingKey);
@@ -288,16 +317,26 @@ class ByokTool {
     delete merged.url;
     const config = this.v.workspace.getConfiguration();
     const settings = [];
-    // Only write selectors for a model explicitly selected from the group being saved.
     const selectedModel = merged.models.find(m => m.id === form.auxiliaryModel);
-    for (const item of SETTINGS) {
+    const fixedDefault = this.edition.preset?.models.find(m => m.id === this.edition.auxiliaryModel);
+    const fixedCandidates = fixedDefault ? [...parseGroups(snapshot.text).value.filter(g => g.vendor === core.VENDOR && !g.name.startsWith(core.TEMP_PREFIX) && g.name !== group.name), merged]
+      .flatMap(g => Array.isArray(g.models) ? g.models : []).filter(m => m?.id === fixedDefault.id) : [];
+    for (const item of this.edition.settings) {
       const preset = form.applyRecommendedSettings === true;
       const legacy = item.formKey && form[item.formKey] === true;
       if (!preset && !legacy) continue;
       const inspected = config.inspect(item.key);
       if (!inspected) { warnings.push(`${tr("此版本未注册 ", "Setting not registered in this version: ")}${item.key}${tr("，已跳过。", "; skipped.")}`); continue; }
-      if (item.model && !selectedModel) continue;
-      const desired = item.model === 'id' ? `customendpoint/${selectedModel.id}` : item.model === 'name' ? `${selectedModel.name} (customendpoint)` : item.value;
+      let desired = item.value;
+      if (item.model && Object.hasOwn(item, 'value')) {
+        // Legacy fixed selectors match the resulting profile, including other provider groups of this vendor.
+        if (!fixedCandidates.some(m => item.model === 'id' || m.name === fixedDefault.name)) {
+          warnings.push(`${item.key}${tr('：未找到预设指定的辅助模型，已跳过。', ': preset auxiliary model not found; skipped.')}`); continue;
+        }
+      } else if (item.model) {
+        if (!selectedModel) continue;
+        desired = item.model === 'id' ? `customendpoint/${selectedModel.id}` : `${selectedModel.name} (customendpoint)`;
+      }
       const previousValue = inspected.globalValue;
       if (core.equal(previousValue, desired)) continue;
       if (preset && previousValue !== undefined && form.overwriteRecommendedSettings !== true) {
@@ -318,7 +357,7 @@ class ByokTool {
     ].filter(Boolean).join('\n\n');
     const answer = await this.v.window.showWarningMessage(tr("确认备份并写入 BYOK 配置？", "Save BYOK configuration with backup?"), { modal: true, detail }, tr("备份并写入", "Save with Backup"));
     if (answer !== tr("备份并写入", "Save with Backup")) return;
-    await this.withLock(async () => {
+    const backup = await this.withLock(async () => {
       const now = await this.readConfig();
       if (now.text !== snapshot.text) throw new Error(tr("确认期间配置已变化，请重新读取。", "Configuration changed during confirmation. Reload and retry."));
       const backup = await this.backup(now, settings);
@@ -341,13 +380,16 @@ class ByokTool {
         }
         backup.meta.status = 'complete';
         await this.saveMeta(backup).catch(() => warnings.push(tr("备份原文件已保存，但结果元数据更新失败。", "The original file was backed up, but updating backup metadata failed.")));
-        await this.refresh(group.name);
-        await this.notice(`${tr("已保存 ", "Saved ")}${group.models.length}${tr(" 个模型，写入 ", " models and wrote ")}${backup.meta.settingsApplied.length}${tr(" 项用户设置。备份：", " user settings. Backup: ")}${backup.folder.toString(true)}${tr("\n请在 Chat 中选择该组的具体模型，不要选择 Auto。尚未验证实际对话。", "\nSelect a specific model from this group in Chat, not Auto. Chat has not been tested.")}` + (warnings.length ? '\n' + warnings.join('\n') : ''), warnings.length ? 'warning' : 'success');
       } catch (error) {
         backup.meta.status = 'failed'; await this.saveMeta(backup).catch(() => {});
         throw new Error(core.safeError(error, [key]) + tr("\n备份：", "\nBackup: ") + backup.folder.toString(true));
       }
+      return backup;
     });
+    // Progress describes the disk write, independent of whether the panel is still open.
+    await this.v.commands.executeCommand('setContext', 'byokManager.configurationSaved', true).then(undefined, () => {});
+    await this.refresh(group.name).catch(() => warnings.push(tr('已保存，但管理器未能刷新，请重新读取。', 'Saved, but the editor could not refresh. Reload the group.')));
+    await this.notice(`${tr("已保存 ", "Saved ")}${group.models.length}${tr(" 个模型，写入 ", " models and wrote ")}${backup.meta.settingsApplied.length}${tr(" 项用户设置。备份：", " user settings. Backup: ")}${backup.folder.toString(true)}${tr("\n请在 Chat 中选择该组的具体模型，不要选择 Auto。尚未验证实际对话。", "\nSelect a specific model from this group in Chat, not Auto. Chat has not been tested.")}` + (warnings.length ? '\n' + warnings.join('\n') : ''), warnings.length ? 'warning' : 'success');
   }
   async restore() {
     const current = await this.readConfig();
@@ -380,7 +422,7 @@ class ByokTool {
       await this.writeConfig(now.text, text);
       const warnings = []; const config = this.v.workspace.getConfiguration();
       for (const applied of choice.meta.settingsApplied || []) {
-        if (!SETTINGS.some(s => s.key === applied.key)) continue;
+        if (!this.edition.settings.some(s => s.key === applied.key)) continue;
         const previous = (choice.meta.settingsBefore || []).find(s => s.key === applied.key);
         const inspected = config.inspect(applied.key);
         if (!previous || !inspected || !core.equal(inspected.globalValue, applied.value)) continue;
@@ -388,15 +430,24 @@ class ByokTool {
         catch { warnings.push(`${applied.key}${tr(" 未能恢复，请手动检查。", " could not be restored; check manually.")}`); }
       }
       this.pendingKey = undefined; await this.refresh();
-      await this.notice(tr("模型配置备份已恢复。", "Model configuration restored.") + (warnings.length ? '\n' + warnings.join('\n') : ''), warnings.length ? 'warning' : 'success');
+      const result = tr("模型配置备份已恢复。", "Model configuration restored.") + (warnings.length ? '\n' + warnings.join('\n') : '');
+      if (this.panel) await this.notice(result, warnings.length ? 'warning' : 'success');
+      else if (warnings.length) void this.v.window.showWarningMessage(result);
+      else void this.v.window.showInformationMessage(result);
     });
   }
   async diagnose() {
     const env = await this.environment();
-    const lines = [tr("BYOK Manager 0.5.0 · 本机兼容性诊断", "BYOK Manager 0.5.0 · Compatibility Diagnostics"), new Date().toISOString(), '',
+    const version = require('../package.json').version;
+    let paths, lockStatus;
+    try { await this.resolveConfig(); paths = this.lockPaths(); }
+    catch (e) { lockStatus = core.safeError(e, [this.pendingKey]); }
+    const lines = [`${this.edition.displayName} ${version} · ${tr("本机兼容性诊断", "Compatibility Diagnostics")}`, new Date().toISOString(), '',
       ...Object.entries(env).map(([k, v]) => `${k}: ${v}`), '',
       tr("当前配置：", "Current configuration: ") + (this.configUri?.toString(true) || tr("尚未定位", "Not located")),
-      tr("工具存储/锁文件目录：", "Tool storage / lock directory: ") + this.context.globalStorageUri.toString(true), '',
+      tr("本扩展存储目录：", "Extension storage directory: ") + this.context.globalStorageUri.toString(true),
+      tr("Profile 共享锁：", "Shared profile lock: ") + (paths?.shared || lockStatus),
+      tr("本扩展兼容锁：", "Legacy extension lock: ") + (paths?.legacy || lockStatus), '',
       tr("此诊断不包含 API Key，不发起网络请求，也不代表模型实际可调用。", "Diagnostics contain no API key, make no network requests, and do not verify model availability."),
       tr("密钥写入依赖内部命令 lm.addLanguageModelsProviderGroup；不是稳定的公开扩展 API。", "Secret entry uses the internal lm.addLanguageModelsProviderGroup command, not a stable public extension API."),
       tr("免 GitHub 登录取决于 VS Code、所选 Harness、BYOK 支持及组织策略。", "GitHub sign-in requirements depend on VS Code, the selected harness, BYOK support and organization policies."),
@@ -405,19 +456,38 @@ class ByokTool {
     await this.v.window.showTextDocument(doc, { preview: true });
   }
 }
-function activate(context) {
-  const vscode = require('vscode');
-  const tool = new ByokTool(vscode, context);
+function actionProvider(vscode) {
+  const labels = isChinese() ? require('../package.nls.zh-cn.json') : require('../package.nls.json');
+  const items = [['open', 'settings-gear'], ['openGuide', 'book'], ['diagnose', 'checklist'], ['restore', 'history']].map(([action, icon]) => {
+    const label = labels['command.' + action];
+    const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+    item.id = 'byokManager.' + action;
+    item.command = { command: item.id, title: label };
+    item.iconPath = new vscode.ThemeIcon(icon);
+    return item;
+  });
+  return { getTreeItem: item => item, getChildren: parent => parent ? [] : items };
+}
+function activate(context, vscode = require('vscode'), edition = checkoutEdition) {
+  const tool = new ByokTool(vscode, context, edition);
   const run = fn => async () => {
     if (tool.busy) { await vscode.window.showInformationMessage(tr("BYOK 助手正在处理当前操作，请勿重复执行。", "BYOK Manager is busy. Do not repeat the operation.")); return; }
     try { await fn(); } catch (e) { await vscode.window.showErrorMessage('BYOK：' + core.safeError(e, [tool.pendingKey])); }
   };
+  const commands = new Map([
+    ['byokManager.openGuide', () => vscode.commands.executeCommand('workbench.action.openWalkthrough', `${context.extension.id}#userGuide`)],
+    ['byokManager.open', run(() => tool.show())],
+    ['byokManager.restore', run(() => tool.handle({ type: 'restore' }))],
+    ['byokManager.diagnose', run(() => tool.diagnose())]
+  ]);
   context.subscriptions.push(
-    vscode.commands.registerCommand('byokManager.open', run(() => tool.show())),
-    vscode.commands.registerCommand('byokManager.restore', run(async () => {
-      tool.busy = true; try { await tool.restore(); } finally { tool.busy = false; }
-    })),
-    vscode.commands.registerCommand('byokManager.diagnose', run(() => tool.diagnose())),
+    vscode.window.registerTreeDataProvider('byokManager.actions', actionProvider(vscode)),
+    ...[...commands].map(([id, handler]) => vscode.commands.registerCommand(id, handler)),
+    ...Object.entries(edition.aliases).map(([id, target]) => {
+      const handler = commands.get(target);
+      if (!handler || commands.has(id)) throw new Error('Invalid edition command alias: ' + id);
+      return vscode.commands.registerCommand(id, handler);
+    }),
     { dispose: () => { tool.pendingKey = undefined; tool.panel?.dispose(); } }
   );
 }

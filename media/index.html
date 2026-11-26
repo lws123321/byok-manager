@@ -5,20 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{CSP_SOURCE}}; script-src 'nonce-{{NONCE}}'; img-src {{CSP_SOURCE}}; connect-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'">
 <link rel="stylesheet" href="{{STYLE_URI}}">
-<title>BYOK Manager</title>
+<title>{{EDITION_DISPLAY_NAME}}</title>
 </head>
 <body>
 <main>
-  <header>
-    <h1>BYOK Manager</h1>
-    <span class="version">0.5.0</span>
-  </header>
+  <h1>{{EDITION_DISPLAY_NAME}}</h1>
   <div id="environment" class="environment" role="status">Checking VS Code environment…</div>
   <section class="settings-section">
     <div class="section-head"><h2>Model Provider</h2><div class="actions"><button id="import" class="quiet">Import JSON</button><button id="export" class="quiet">Export Preset</button></div></div>
     <div class="load-row">
       <select id="providers" aria-label="Existing model groups"><option value="">New model group</option></select>
       <button id="refresh" class="secondary">Reload</button><button id="new" class="secondary">New</button>
+      <!--EDITION_PRESET_ACTION-->
     </div>
     <div class="grid-two">
       <label>Group Name<input id="name" type="text" value="custom" maxlength="128" spellcheck="false" autocomplete="off"></label>
@@ -33,9 +31,9 @@
     <label class="check"><input id="noAuth" type="checkbox">Unauthenticated endpoint: no API key</label>
   </section>
   <section class="settings-section models-section">
-    <div class="section-head"><h2>Models <span id="modelCount" class="count">0</span></h2><div class="actions"><button id="validate" class="quiet">Validate</button><button id="createModel" class="primary small">+ Add Model</button></div></div>
+    <div class="section-head"><h2>Models <span id="modelCount" class="count">0</span></h2><div class="actions"><button id="validate" class="quiet">Validate</button><button id="createModel" class="secondary">Add Model</button></div></div>
     <div class="model-toolbar"><input id="searchModels" type="text" placeholder="Search model name or ID" aria-label="Search models" autocomplete="off"><button id="openMerge" class="secondary">Append JSON</button></div>
-    <div id="modelList" class="model-list" aria-label="Model list"></div>
+    <div id="modelList" class="model-list" role="region" aria-label="Model list"></div>
     <p id="modelProblem" class="hint" hidden></p>
     <details id="builder">
       <summary>Batch Add Model IDs</summary>
@@ -71,16 +69,23 @@
     <label class="check"><input id="applyRecommendedSettings" type="checkbox" checked>Apply recommended VS Code settings</label>
     <label class="check"><input id="overwriteRecommendedSettings" type="checkbox">Overwrite existing settings</label>
     <label>Default Auxiliary Model (optional)<select id="auxiliaryModel"><option value="">Keep existing model selectors</option></select></label>
-    <details><summary>View Recommended Settings</summary><div class="builder-body"><pre class="settings-preview">{{RECOMMENDED_SETTINGS}}</pre><p class="hint">Only supported user settings are written. All changes are listed before saving. Select an auxiliary model to update the four model selectors.</p></div></details>
+    <details><summary>View Recommended Settings</summary><div class="builder-body"><pre class="settings-preview">{{RECOMMENDED_SETTINGS}}</pre><p class="hint">Only supported user settings are written. All changes are listed before saving. Model selectors are updated only when an auxiliary model is selected.</p></div></details>
   </section>
-  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-  <footer>
-    <div class="main-actions"><button id="apply" class="primary">Save with Backup</button><button id="restore" class="secondary">Restore Backup</button></div>
-    <div class="footer-links"><button id="manage" class="text-button">Native Model Management</button><button id="openJson" class="text-button">Native Configuration</button><button id="diagnose" class="text-button">Diagnostics</button><button id="reload" class="text-button">Reload Window</button></div>
+  <section class="settings-section">
+    <h2>Configuration and Diagnostics</h2>
+    <div class="utility-links"><button id="manage" class="text-button">Native Model Management</button><button id="openJson" class="text-button">Native Configuration</button><button id="diagnose" class="text-button">Diagnostics</button><button id="reload" class="text-button">Reload Window</button></div>
     <p class="path" id="configPath">Configuration file not located</p>
     <p class="hint">Secret entry uses an internal VS Code command; GitHub authorization and organization policy are unchanged.</p>
-  </footer>
+  </section>
 </main>
+<footer>
+  <div class="main-actions">
+    <button id="apply" class="primary">Save with Backup</button>
+    <button id="restore" class="secondary">Restore Backup</button>
+    <span id="saveState" role="status">No unsaved changes</span>
+  </div>
+  <div id="notice" class="notice" role="status" aria-live="polite" tabindex="0" hidden></div>
+</footer>
 <script nonce="{{NONCE}}" src="{{SCRIPT_URI}}"></script>
 </body>
 </html>

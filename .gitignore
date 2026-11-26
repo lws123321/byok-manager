@@ -8,3 +8,5 @@ node_modules/
 .env.*
 *.pem
 *.key
+/editions/enterprise.local/
+/editions/*.local.json

@@ -1,0 +1,20 @@
+{
+  "edition": "public",
+  "publisher": "asong-dev",
+  "name": "byok-manager",
+  "displayName": "BYOK Manager",
+  "preset": null,
+  "settings": [
+    { "formKey": "enableAgentHost", "key": "chat.agentHost.byokModels.enabled", "value": true },
+    { "formKey": "utilityMain", "key": "chat.byokUtilityModelDefault", "value": "mainAgent" },
+    { "key": "chat.requestQueuing.defaultAction", "value": "queue" },
+    { "key": "chat.planAgent.defaultModel", "model": "name" },
+    { "key": "inlineChat.defaultModel", "model": "name" },
+    { "key": "chat.utilityModel", "model": "id" },
+    { "key": "chat.utilitySmallModel", "model": "id" }
+  ],
+  "auxiliaryModel": "",
+  "aliases": {},
+  "features": { "presetButton": false },
+  "locales": { "en": {}, "zh-cn": {} }
+}

@@ -74,6 +74,7 @@ function manifest(pkg) {
 const CONTENT_TYPES = `<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="png" ContentType="image/png" />
+  <Default Extension="svg" ContentType="image/svg+xml" />
   <Default Extension="json" ContentType="application/json" />
   <Default Extension="js" ContentType="application/javascript" />
   <Default Extension="css" ContentType="text/css" />
@@ -82,33 +83,55 @@ const CONTENT_TYPES = `<?xml version="1.0" encoding="utf-8"?>
   <Default Extension="txt" ContentType="text/plain" />
   <Default Extension="vsixmanifest" ContentType="text/xml" />
 </Types>\n`;
-async function filesIn(directory) {
-  const result = [];
-  for (const entry of await fs.readdir(path.join(ROOT, directory), { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) throw new Error('Symlinks are not packaged.');
-    const name = directory + '/' + entry.name;
-    if (entry.isDirectory()) result.push(...await filesIn(name)); else if (entry.isFile()) result.push(name);
-  }
-  return result;
+const { runtimeFiles, safeRead, withStage } = require('./build');
+const { auditSource, verifyVsix } = require('./audit');
+const sourceFiles = Object.freeze([...runtimeFiles, 'editions/public.json', 'editions/enterprise.example.json',
+  'TESTING.md','RELEASE.md','.gitignore','.vscodeignore','.vscode/launch.json',
+  'scripts/audit.js','scripts/build.js','scripts/package.js','scripts/release.js',
+  'test/core.test.js','test/extension.test.js','test/release.test.js','test/webview.test.js','test/build-editions.test.js','test/audit.test.js',
+  'test/browser-smoke.js','test/host-smoke.js','test/run-host-smoke.js','test/install-onboarding.js','test/compare-legacy.js','test/verify_vsix.py']);
+
+// Write/verify on the output volume; rename only verified bytes into the public-facing location.
+async function withCandidate(outDir, job) {
+  await fs.mkdir(outDir, {recursive:true});
+  const tmp = await fs.mkdtemp(path.join(outDir,'.candidate-'));
+  try { return await job(tmp); } finally { await fs.rm(tmp,{recursive:true,force:true}); }
 }
-async function build(outDir = path.join(ROOT, 'dist')) {
-  const pkg = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf8'));
-  const runtimeFiles = ['package.json', 'package.nls.json', 'package.nls.zh-cn.json', 'README.md', 'README.zh-CN.md', 'LICENSE.txt', 'CHANGELOG.md', 'SUPPORT.md', 'SECURITY.md', ...await filesIn('src'), ...await filesIn('media')];
-  const entries = await Promise.all(runtimeFiles.map(async name => ['extension/' + name, await fs.readFile(path.join(ROOT, name))]));
-  const vsix = zip([['[Content_Types].xml', CONTENT_TYPES], ['extension.vsixmanifest', manifest({ ...pkg, description: JSON.parse(await fs.readFile(path.join(ROOT, 'package.nls.json'), 'utf8'))['extension.description'] })], ...entries]);
-  const sourceFiles = [...runtimeFiles, 'TESTING.md', 'RELEASE.md', '.gitignore', '.vscodeignore', ...await filesIn('scripts'), ...await filesIn('test'), ...await filesIn('.vscode')];
-  const source = zip(await Promise.all(sourceFiles.map(async name => [pkg.name + '/' + name, await fs.readFile(path.join(ROOT, name))])));
-  await fs.mkdir(outDir, { recursive: true });
-  const artifacts = [[`byok-manager-${pkg.version}.vsix`, vsix], [`byok-manager-source-${pkg.version}.zip`, source]];
-  for (const [name, bytes] of artifacts) await fs.writeFile(path.join(outDir, name), bytes);
-  const hashes = artifacts.map(([name, bytes]) => crypto.createHash('sha256').update(bytes).digest('hex') + '  ' + name).join('\n') + '\n';
-  await fs.writeFile(path.join(outDir, 'SHA256SUMS.txt'), hashes, 'utf8');
-  for (const [name, bytes] of artifacts) console.log(`${path.join(outDir, name)} (${bytes.length} bytes)`);
-  return artifacts;
+async function build(edition = 'public', options = {}) {
+  if (options.source && edition !== 'public') throw new Error('Only the public source archive is distributable.');
+  await auditSource(ROOT);
+  const outDir = path.resolve(options.outDir || path.join(ROOT,'dist',edition));
+  return withStage(edition, async ({stage,pkg,files}) => withCandidate(outDir, async tmp => {
+    const entries = await Promise.all(files.map(async f => ['extension/'+f,await safeRead(stage,f)]));
+    const nls = JSON.parse(await safeRead(stage,'package.nls.json'));
+    const name = `${pkg.publisher}.${pkg.name}-${pkg.version}.vsix`;
+    const vsix = zip([['[Content_Types].xml',CONTENT_TYPES],['extension.vsixmanifest',manifest({...pkg,description:nls['extension.description']})],...entries]);
+    const candidate = path.join(tmp,name);
+    await fs.writeFile(candidate,vsix);
+    await verifyVsix(candidate,edition,pkg,{stage,files,expectedEnterpriseId:options.expectedEnterpriseId});
+    const artifacts = [[name,vsix]];
+    if (options.source) {
+      const sourceName = `${pkg.name}-source-${pkg.version}.zip`;
+      const bytes = zip(await Promise.all(sourceFiles.map(async f => [pkg.name+'/'+f,await safeRead(ROOT,f)])));
+      await fs.writeFile(path.join(tmp,sourceName),bytes); artifacts.push([sourceName,bytes]);
+    }
+    const sums = artifacts.map(([f,b]) => `${crypto.createHash('sha256').update(b).digest('hex')}  ${f}\n`).join('');
+    await fs.writeFile(path.join(tmp,'SHA256SUMS.txt'),sums);
+    for (const f of [...artifacts.map(([f]) => f),'SHA256SUMS.txt']) await fs.rename(path.join(tmp,f),path.join(outDir,f));
+    return artifacts.map(([f]) => path.join(outDir,f));
+  }),options);
 }
 if (require.main === module) {
-  const args = process.argv.slice(2);
-  if (args.length && (args.length !== 2 || args[0] !== '--out')) { console.error('Usage: node scripts/package.js [--out DIR]'); process.exitCode = 1; }
-  else build(args.length ? path.resolve(args[1]) : undefined).catch(error => { console.error(error.message); process.exitCode = 1; });
+  (async () => {
+    const args = process.argv.slice(2); let edition='public', outDir, source=false;
+    if (args[0] && !args[0].startsWith('--')) edition=args.shift();
+    while (args.length) {
+      const arg=args.shift();
+      if(arg==='--out' && args[0] && !outDir) outDir=path.resolve(args.shift());
+      else if(arg==='--source' && !source) source=true;
+      else throw new Error('Usage: node scripts/package.js [public|enterprise] [--out DIR] [--source]');
+    }
+    for (const f of await build(edition,{outDir,source})) console.log(f);
+  })().catch(e => {console.error(e.message);process.exitCode=1;});
 }
-module.exports = { zip, crc32, manifest, build };
+module.exports = { zip, crc32, manifest, build, withCandidate, sourceFiles };

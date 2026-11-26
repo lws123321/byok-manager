@@ -2,8 +2,8 @@
   "name": "byok-manager",
   "displayName": "BYOK Manager",
   "description": "%extension.description%",
-  "version": "0.5.0",
-  "publisher": "asong-local",
+  "version": "0.6.0",
+  "publisher": "asong-dev",
   "license": "MIT",
   "engines": {
     "vscode": "^1.122.0"
@@ -33,7 +33,61 @@
     }
   },
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "byokManager", "title": "%container.title%", "icon": "media/key.svg" }
+      ]
+    },
+    "views": {
+      "byokManager": [
+        { "id": "byokManager.actions", "name": "%view.actions%" }
+      ]
+    },
+    "walkthroughs": [
+      {
+        "id": "userGuide",
+        "title": "%guide.title%",
+        "description": "%guide.description%",
+        "steps": [
+          {
+            "id": "open", "title": "%guide.open.title%", "description": "%guide.open.description%",
+            "media": { "image": "%guide.provider.image%", "altText": "%guide.provider.alt%" },
+            "completionEvents": ["onCommand:byokManager.open"]
+          },
+          {
+            "id": "provider", "title": "%guide.provider.title%", "description": "%guide.provider.description%",
+            "media": { "image": "%guide.provider.image%", "altText": "%guide.provider.alt%" }
+          },
+          {
+            "id": "model", "title": "%guide.model.title%", "description": "%guide.model.description%",
+            "media": { "image": "%guide.model.image%", "altText": "%guide.model.alt%" }
+          },
+          {
+            "id": "auxiliary", "title": "%guide.auxiliary.title%", "description": "%guide.auxiliary.description%",
+            "media": { "image": "%guide.save.image%", "altText": "%guide.save.alt%" }
+          },
+          {
+            "id": "save", "title": "%guide.save.title%", "description": "%guide.save.description%",
+            "media": { "image": "%guide.save.image%", "altText": "%guide.save.alt%" },
+            "completionEvents": ["onContext:byokManager.configurationSaved"]
+          },
+          {
+            "id": "maintain", "title": "%guide.maintain.title%", "description": "%guide.maintain.description%",
+            "media": { "image": "%guide.model.image%", "altText": "%guide.model.alt%" }
+          },
+          {
+            "id": "faq", "title": "%guide.faq.title%", "description": "%guide.faq.description%",
+            "media": { "image": "%guide.save.image%", "altText": "%guide.save.alt%" }
+          }
+        ]
+      }
+    ],
     "commands": [
+      {
+        "command": "byokManager.openGuide",
+        "title": "%command.openGuide%",
+        "category": "BYOK"
+      },
       {
         "command": "byokManager.open",
         "title": "%command.open%",
@@ -52,11 +106,17 @@
     ]
   },
   "scripts": {
+    "vscode:prepublish": "node -e \"console.error('Use the edition packaging commands, not vsce from the checkout.'); process.exit(1)\"",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/extension.js && node --check src/core.js && node --check src/jsonc.js && node --check media/app.js && node --check src/i18n.js && node --check scripts/package.js && node --check scripts/release.js",
-    "package": "node scripts/package.js",
-    "package:marketplace": "node scripts/release.js package",
-    "publish:marketplace": "node scripts/release.js publish"
+    "check": "node --check src/extension.js && node --check src/core.js && node --check src/jsonc.js && node --check media/app.js && node --check src/i18n.js && node --check scripts/build.js && node --check scripts/audit.js && node --check scripts/package.js && node --check scripts/release.js",
+    "build:public": "node scripts/build.js public",
+    "build:enterprise": "node scripts/build.js enterprise",
+    "package": "node scripts/package.js public --source",
+    "package:public": "node scripts/package.js public",
+    "package:enterprise": "node scripts/package.js enterprise",
+    "package:all": "npm run package:public && npm run package:enterprise",
+    "package:marketplace": "node scripts/release.js package public",
+    "publish:marketplace": "node scripts/release.js publish public"
   },
   "icon": "media/icon.png",
   "galleryBanner": {

@@ -1,0 +1,24 @@
+{
+  "edition": "enterprise",
+  "publisher": "example-org",
+  "name": "example-model-manager",
+  "displayName": "Example Model Manager",
+  "preset": {
+    "name": "Example provider",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "url": "https://gateway.example.invalid/v1",
+    "models": [{ "id": "example-text", "name": "Example Text", "contextWindow": 4096, "maxOutputTokens": 512, "toolCalling": false, "vision": false }]
+  },
+  "settings": [
+    { "formKey": "enableAgentHost", "key": "chat.agentHost.byokModels.enabled", "value": true },
+    { "key": "chat.utilityModel", "model": "id" }
+  ],
+  "auxiliaryModel": "example-text",
+  "aliases": { "exampleManager.open": "byokManager.open" },
+  "features": { "presetButton": true },
+  "locales": {
+    "en": { "edition.loadPreset": "Load example preset", "guide.title": "Example setup guide" },
+    "zh-cn": { "edition.loadPreset": "加载示例预设", "guide.title": "示例配置指南" }
+  }
+}

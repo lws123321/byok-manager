@@ -1,49 +1,56 @@
 'use strict';
-// Run only from the maintainer's machine. Never reads or embeds access tokens.
-const fs = require('node:fs');
+const fs = require('node:fs/promises');
 const path = require('node:path');
-const os = require('node:os');
 const { spawnSync } = require('node:child_process');
-const root = path.resolve(__dirname, '..');
-const runtime = ['package.json', 'package.nls.json', 'package.nls.zh-cn.json', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'LICENSE.txt', 'SECURITY.md', 'SUPPORT.md', 'src', 'media', '.vscodeignore'];
+const { ROOT, withStage } = require('./build');
+const { withCandidate } = require('./package');
+const { auditSource, verifyVsix } = require('./audit');
+
 function releaseManifest(pkg, publisher, repository) {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(publisher || '') || publisher === 'asong-local') throw new Error('Set BYOK_PUBLISHER to your registered Marketplace publisher ID (not the local placeholder).');
-  const output = { ...pkg, publisher };
+  if (pkg.publisher !== 'asong-dev' || pkg.name !== 'byok-manager' || (publisher !== undefined && publisher !== pkg.publisher)) throw new Error('Marketplace is restricted to the fixed Public identity.');
+  const result = { ...pkg };
   if (repository) {
-    const u = new URL(repository);
-    if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash) throw new Error('BYOK_REPOSITORY must be a public HTTPS repository URL with no credentials.');
-    output.repository = { type: 'git', url: u.href };
+    let url;
+    try { url = new URL(repository); } catch { throw new Error('Invalid BYOK_REPOSITORY.'); }
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error('BYOK_REPOSITORY must be a public HTTPS repository URL without credentials.');
+    result.repository = { type:'git', url:url.href };
   }
-  return output;
+  return result;
 }
-function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, stdio: 'inherit' });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Command failed (exit ${result.status}).`);
+function assertMayPublish(edition,env) {
+  if (edition !== 'public' || env.BYOK_CONFIRM_PUBLISH !== 'yes') throw new Error('Only Public may publish, with BYOK_CONFIRM_PUBLISH=yes.');
 }
-function main() {
-  const action = process.argv[2];
-  if (!['package','publish'].includes(action)) throw new Error('Usage: node scripts/release.js package|publish');
-  const manifest = releaseManifest(JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')), process.env.BYOK_PUBLISHER, process.env.BYOK_REPOSITORY);
-  // Use locally installed official vsce CLI; no shell interpolation or downloads.
-  const vsceRoot = path.join(root, 'node_modules', '@vscode', 'vsce');
-  if (!fs.existsSync(path.join(vsceRoot, 'package.json'))) throw new Error('Install the official CLI: npm install --no-save --package-lock=false @vscode/vsce');
-  const vscePkg = JSON.parse(fs.readFileSync(path.join(vsceRoot,'package.json'),'utf8'));
-  const cli = path.resolve(vsceRoot, typeof vscePkg.bin === 'string' ? vscePkg.bin : vscePkg.bin.vsce);
-  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'byok-release-'));
-  try {
-    for (const file of runtime) fs.cpSync(path.join(root,file), path.join(stage,file), {recursive:true});
-    fs.writeFileSync(path.join(stage,'package.json'), JSON.stringify(manifest,null,2)+'\n');
-    const out = path.join(root,'dist', `${manifest.publisher}.${manifest.name}-${manifest.version}.vsix`);
-    fs.mkdirSync(path.dirname(out), {recursive:true});
-    run(process.execPath, [cli,'package','--no-dependencies','--out',out], stage);
-    console.log(`Marketplace candidate: ${out}`);
-    if (action === 'publish') {
-      if (process.env.BYOK_CONFIRM_PUBLISH !== 'yes') throw new Error('Set BYOK_CONFIRM_PUBLISH=yes to explicitly publish. Otherwise upload the candidate manually.');
-      // Uses vsce's own supported authentication, not an embedded token.
-      run(process.execPath, [cli,'publish','--packagePath',out], stage);
-    }
-  } finally { fs.rmSync(stage,{recursive:true,force:true}); }
+function vsce(cli, args, cwd) {
+  const result = spawnSync(process.execPath,[cli,...args],{cwd,stdio:'inherit'});
+  if (result.error || result.status !== 0) throw new Error('Official vsce command failed.');
 }
-if (require.main === module) { try { main(); } catch (e) { console.error(e.message); process.exitCode=1; } }
-module.exports = { releaseManifest };
+async function release(action, edition='public') {
+  if (edition !== 'public' || !['package','publish'].includes(action)) throw new Error('Usage: node scripts/release.js package|publish public');
+  if (action === 'publish') assertMayPublish(edition,process.env);
+  const vsceRoot = path.join(ROOT,'node_modules','@vscode','vsce');
+  let metadata;
+  try { metadata = JSON.parse(await fs.readFile(path.join(vsceRoot,'package.json'),'utf8')); }
+  catch { throw new Error('Install the official CLI: npm install --no-save --package-lock=false @vscode/vsce'); }
+  if (metadata.name !== '@vscode/vsce') throw new Error('Expected locally installed @vscode/vsce.');
+  const cli = path.resolve(vsceRoot,typeof metadata.bin === 'string' ? metadata.bin : metadata.bin.vsce);
+  if (!cli.startsWith(vsceRoot + path.sep)) throw new Error('Invalid official CLI path.');
+  await auditSource(ROOT);
+  return withStage(edition,async ({stage,pkg,files}) => {
+    const manifest = releaseManifest(pkg,process.env.BYOK_PUBLISHER,process.env.BYOK_REPOSITORY);
+    await fs.writeFile(path.join(stage,'package.json'),JSON.stringify(manifest,null,2)+'\n');
+    const out = path.join(ROOT,'dist','marketplace');
+    return withCandidate(out, async tmp => {
+      const name = `${manifest.publisher}.${manifest.name}-${manifest.version}.vsix`;
+      const candidate = path.join(tmp,name);
+      vsce(cli,['package','--no-dependencies','--out',candidate],stage);
+      await verifyVsix(candidate,edition,manifest,{stage,files});
+      // Publish the verified, privately staged file; do not accept someone else's package path.
+      if (action === 'publish') vsce(cli,['publish','--packagePath',candidate],stage);
+      const dest = path.join(out,name); await fs.rename(candidate,dest); return dest;
+    });
+  });
+}
+if (require.main === module) {
+  (async () => { const args=process.argv.slice(2); if(args.length>2) throw new Error('Unexpected release arguments.'); console.log(await release(...args)); })().catch(e=>{console.error(e.message);process.exitCode=1;});
+}
+module.exports = { releaseManifest, assertMayPublish, release };
