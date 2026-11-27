@@ -222,7 +222,7 @@ function only(parent, tag) {
   const found = parent.children.filter(c => c.name === tag);
   check(found.length === 1, 'Missing or duplicate manifest element: '+tag); return found[0];
 }
-const baseFiles = ['package.json','edition.json','package.nls.json','package.nls.zh-cn.json','README.md','README.zh-CN.md','CHANGELOG.md','LICENSE.txt','SECURITY.md','SUPPORT.md','src/extension.js','src/core.js','src/i18n.js','src/jsonc.js','media/app.js','media/key.svg','media/icon.png','media/index.html','media/index.zh-cn.html','media/style.css', ...['en','zh-cn'].flatMap(lang => ['provider','model','save'].map(step => `media/guide/${step}-${lang}.png`))];
+const baseFiles = ['package.json','edition.json','package.nls.json','package.nls.zh-cn.json','README.md','README.zh-CN.md','CHANGELOG.md','LICENSE.txt','SECURITY.md','SUPPORT.md','src/extension.js','src/discovery.js','src/core.js','src/i18n.js','src/jsonc.js','media/app.js','media/key.svg','media/icon.png','media/index.html','media/index.zh-cn.html','media/style.css', ...['en','zh-cn'].flatMap(lang => ['provider','model','save'].map(step => `media/guide/${step}-${lang}.png`))];
 const mime = { png:'image/png', svg:'image/svg+xml', md:'text/markdown', txt:'text/plain', json:'application/json', css:'text/css', js:'application/javascript', html:'text/html', vsixmanifest:'text/xml' };
 function verifyMetadata(entries, actual, pkg) {
   const manifest = xmlDocument(entries.get('extension.vsixmanifest'));

@@ -15,7 +15,7 @@ const models = Array.from({ length: 12 }, (_, i) => ({
   maxInputTokens: 28672, maxOutputTokens: 4096, toolCalling: true, vision: true, thinking: true, supportsReasoningEffort: ['low', 'high']
 }));
 const state = { type: 'state', env: { version: 'test', openJson: true, provider: true, trusted: true, desktop: true },
-  groups: [{ name: 'fixture', count: models.length }], selected: 'fixture', draft: { name: 'fixture', apiType: 'messages',
+  groups: [{ name: 'fixture', count: models.length, hasKey:true }, {name:'sandbox',count:0,hasKey:false}], selected: 'fixture', draft: { name: 'fixture', apiType: 'messages',
     defaultUrl: 'https://example.invalid/v1', modelsText: JSON.stringify(models) }, configPath: '/synthetic/profile/chatLanguageModels.json' };
 const emit = (page, data) => page.evaluate(data => window.dispatchEvent(new MessageEvent('message', { data })), data);
 const list = page => page.locator('#modelsText').evaluate(el => JSON.parse(el.value));
@@ -43,18 +43,53 @@ async function checkLayout(page, width, chinese) {
   const before = await footer();
   const row = page.locator('#modelList .model-item').first();
   await row.scrollIntoViewIfNeeded();
+  const disclosure = row.locator('.model-effort > summary');
+  assert.ok(!(await row.innerText()).includes('low'), 'effort levels should be collapsed by default');
+  await disclosure.focus(); await disclosure.press('Enter');
   const visible = await row.innerText();
   for (const value of [models[0].id, models[0].name, 'Responses', '32,768', '28,672', '4,096', 'low', 'high',
     ...(chinese ? ['工具', '视觉', '思考'] : ['Tools', 'Vision', 'Reasoning'])]) assert.ok(visible.includes(value), `missing visible model field '${value}' in ${visible}`);
-  for (const action of await row.getByRole('button').all()) await action.click({ trial: true });
+  await disclosure.press('Enter');
+  await row.getByRole('button', {name: chinese ? /^编辑/ : /^Edit/}).click({trial:true});
+  await row.locator('.row-more > summary').click();
+  for (const label of (chinese ? [/^复制/, /^删除/] : [/^Copy/, /^Delete/])) {
+    const action = row.getByRole('button', {name:label});
+    const box = await action.boundingBox(); assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1);
+    await action.click({trial:true});
+  }
+  await row.locator('.row-more > summary').click();
   const atBottom = await main.evaluate(el => {
     el.scrollTop = el.scrollHeight;
     return { bottom: el.scrollTop, pageScroll: document.scrollingElement.scrollTop, overflow: Math.max(el.scrollWidth - el.clientWidth,
       document.documentElement.scrollWidth - innerWidth, document.querySelector('footer').scrollWidth - document.querySelector('footer').clientWidth) };
   });
-  assert.ok(atBottom.bottom > 200 && !atBottom.pageScroll, `main did not scroll independently: ${JSON.stringify(atBottom)}`);
+  assert.ok(atBottom.bottom > 0 && !atBottom.pageScroll, `main did not scroll independently: ${JSON.stringify(atBottom)}`);
   assert.ok(atBottom.overflow <= 1, `horizontal overflow: ${atBottom.overflow}px`);
   assert.deepEqual(await footer(), before, 'footer moved while scrolling');
+}
+
+async function discoveryDraft(page) {
+  const button = page.locator('#discoverModels');
+  assert.ok(await button.isDisabled(), 'Messages uses manual entry');
+  await page.locator('#connectionEditor > summary').click();
+  await page.locator('#apiType').selectOption('responses');
+  await page.locator('#connectionEditor > summary').click();
+  const before = await list(page);
+  assert.equal(await page.evaluate(() => window.messages.some(m => m.type === 'discoverModels')), false);
+  await button.click();
+  const request = await page.evaluate(() => window.messages.at(-1));
+  assert.deepEqual(request, {type:'discoverModels',form:{defaultUrl:state.draft.defaultUrl,apiType:'responses',modelsText:await page.locator('#modelsText').inputValue(),noAuth:false}});
+  // Simulate the native multi-select returning an ID-only model. Nothing has been saved.
+  await emit(page, { type:'models', text: JSON.stringify([...before, {id:'catalogue-fixture'}]) });
+  await emit(page, { type:'busy', value:false });
+  const row = page.locator('.model-item').filter({hasText:'catalogue-fixture'});
+  await row.getByRole('button').first().click();
+  assert.equal(await page.locator('#editId').inputValue(), 'catalogue-fixture');
+  assert.equal(await page.locator('#editOutput').inputValue(), '');
+  await page.locator('#editContext').fill('4096'); await page.locator('#editOutput').fill('256');
+  await page.locator('#saveModel').click();
+  assert.equal((await list(page)).at(-1).maxOutputTokens, 256);
+  assert.equal(await page.evaluate(() => window.messages.some(m => m.type === 'apply')), false);
 }
 
 async function crud(page, chinese) {
@@ -75,10 +110,12 @@ async function crud(page, chinese) {
   await byId('editName').fill('Renamed fixture');
   await byId('saveModel').click();
   assert.equal((await list(page)).find(m => m.id === 'smoke-created').name, 'Renamed fixture');
+  await row().locator('.row-more > summary').click();
   await row().getByRole('button', { name: chinese ? /^复制/ : /^Copy/ }).click();
   await byId('editId').fill('smoke-copy'); await byId('saveModel').click();
   assert.equal((await list(page)).at(-1).name, 'Renamed fixture');
   const copy = page.locator('#modelList .model-item').filter({ has: page.getByText('smoke-copy', { exact: true }) });
+  await copy.locator('.row-more > summary').click();
   await copy.getByRole('button', { name: chinese ? /^删除/ : /^Delete/ }).click();
   await byId('confirmDelete').click();
   const remaining = await list(page);
@@ -115,15 +152,22 @@ async function captureGuide(page, language) {
   const byId = id => page.locator(`#${id}`);
   const provider = 'Demo Provider';
   const endpoint = 'https://api.example.invalid/v1';
-  await emit(page, { type: 'state', env: state.env, groups: [], selected: '', configPath: 'chatLanguageModels.json',
-    draft: { name: 'custom', defaultUrl: '', apiType: 'responses', modelsText: '[]' } });
+  const demoModels = ['Code Assistant', 'Vision Chat', 'Reasoning Mini', 'Text Fast'].map((name, index) => ({
+    name, id: 'example/' + name.toLowerCase().replaceAll(' ', '-'), contextWindow: index ? 65536 : 131072,
+    maxOutputTokens: index ? 4096 : 16384, toolCalling: index !== 3, vision: index === 1, thinking: index === 0 || index === 2,
+    ...(index === 0 || index === 2 ? { supportsReasoningEffort: ['low','medium','high'] } : {})
+  }));
+  await emit(page, { type: 'state', env: state.env, groups: [{name:provider,count:demoModels.length,hasKey:true},{name:'Demo Sandbox',count:2,hasKey:false}], selected: provider, configPath: 'chatLanguageModels.json',
+    draft: { name: provider, defaultUrl: endpoint, apiType: 'responses', modelsText: JSON.stringify(demoModels) } });
   await emit(page, { type: 'busy', value: false });
-  await byId('name').fill(provider);
-  await byId('defaultUrl').fill(endpoint);
-  await page.locator('.settings-section').first().getByRole('heading').click();
-  const section = await page.locator('.settings-section').first().boundingBox();
+  assert.ok(await byId('switchGroup').isVisible() && await byId('switchGroup').isEnabled());
+  assert.equal(await byId('connectionEditor').evaluate(el => el.open), false);
+  assert.ok(await byId('connectionEndpoint').isVisible());
   const { width, height } = page.viewportSize();
-  await page.screenshot({ ...output('provider'), clip: { x: 0, y: section.y, width, height: section.height } });
+  const lastRow = await page.locator('.model-item').last().boundingBox();
+  const bar = await page.locator('footer').boundingBox();
+  assert.ok(lastRow && bar && lastRow.y + lastRow.height <= bar.y && bar.y + bar.height <= height + 1, 'overview should show all four models and save bar');
+  await page.screenshot(output('provider'));
 
   await byId('createModel').click();
   await byId('editId').fill('example-chat');
@@ -141,21 +185,25 @@ async function captureGuide(page, language) {
     height: Math.floor(dialog.y + dialog.height) - y } });
 
   await byId('saveModel').click();
+  await byId('settingsPanel').locator(':scope > summary').click();
   await byId('auxiliaryModel').selectOption('example-chat');
   assert.equal(await byId('saveState').getAttribute('data-state'), 'dirty');
   await page.locator('main').evaluate(el => { el.scrollTop = el.scrollHeight; });
-  const options = await page.locator('.settings-section.options').boundingBox();
-  await page.screenshot({ ...output('save'), clip: { x: 0, y: options.y, width, height: height - options.y } });
+  const options = await byId('settingsPanel').boundingBox();
+  const cropTop = Math.max(0, options.y);
+  const selector = await byId('auxiliaryModel').boundingBox();
+  assert.ok(selector && selector.y >= cropTop && selector.y + selector.height <= (await page.locator('footer').boundingBox()).y);
+  await page.screenshot({ ...output('save'), clip: { x: 0, y: cropTop, width, height: height - cropTop } });
 }
 
 async function scenario(browser, language, theme, screenshots = false) {
   const context = await browser.newContext({ locale: language, colorScheme: theme === 'light' ? 'light' : 'dark', serviceWorkers: 'block',
-    ...(screenshots && { viewport: { width: 760, height: 760 }, deviceScaleFactor: 2 }) });
+    ...(screenshots && { viewport: { width: 1016, height: 710 }, deviceScaleFactor: 1.5 }) });
   try {
     const tool = new ByokTool({ env: { language }, Uri: { joinPath: path.join } }, { extensionPath: root, extensionUri: root });
     const html = await tool.html({ cspSource: origin, asWebviewUri: uri => `${origin}/${path.basename(uri)}` });
     const p = palettes[theme];
-    const themeCss = screenshots ? guideThemeCss : `:root { --vscode-editor-background:${p.background}; --vscode-foreground:${p.foreground}; --vscode-settings-textInputBackground:${p.field}; --vscode-settings-dropdownBackground:rgb(90, 91, 92); --vscode-button-background:${p.button}; --vscode-textLink-foreground:rgb(11, 140, 221); --vscode-errorForeground:rgb(220, 60, 65); --vscode-settings-headerBorder:rgb(71, 72, 73); --vscode-contrastBorder:rgb(255, 238, 17); }`;
+    const themeCss = screenshots ? guideThemeCss : `:root { --vscode-editor-background:${p.background}; --vscode-foreground:${p.foreground}; --vscode-input-background:${p.field}; --vscode-dropdown-background:rgb(90, 91, 92); --vscode-button-background:${p.button}; --vscode-textLink-foreground:rgb(11, 140, 221); --vscode-errorForeground:rgb(220, 60, 65); --vscode-panel-border:rgb(71, 72, 73); ${theme === 'high-contrast' ? '--vscode-contrastBorder:rgb(255, 238, 17);' : ''} }`;
     const resources = new Map([['/', ['text/html', html]], ['/app.js', ['text/javascript', fs.readFileSync(path.join(root, 'media', 'app.js'))]],
       ['/style.css', ['text/css', themeCss + fs.readFileSync(path.join(root, 'media', 'style.css'), 'utf8')]]]);
     const problems = [];
@@ -178,19 +226,41 @@ async function scenario(browser, language, theme, screenshots = false) {
       console.log(`Captured provider, model and save: ${language}`);
       return;
     }
+    await page.setViewportSize({width:320,height:640});
+    await emit(page, {...state, groups:[], selected:'', draft:{...state.draft,modelsText:'[]'}});
+    await emit(page, { type: 'busy', value: false });
+    const emptySwitch = page.locator('#switchGroup');
+    assert.ok(await page.locator('#name').isVisible(), 'new group exposes connection fields');
+    assert.ok(await emptySwitch.isVisible() && await emptySwitch.isDisabled());
+    assert.ok(await page.locator('#new').isEnabled() && await page.locator('#refresh').isEnabled());
     await emit(page, { type: 'busy', value: true });
     await emit(page, state);
     await emit(page, { type: 'busy', value: false });
     assert.deepEqual(problems, [], 'initializing the webview');
     const color = (selector, property) => page.locator(selector).first().evaluate((el, prop) => getComputedStyle(el)[prop], property);
-    assert.equal(await color('#providers', 'backgroundColor'), 'rgb(90, 91, 92)');
+    assert.equal(await page.locator('select#providers').count(), 0);
+    assert.equal(await page.locator('#connectionEditor').evaluate(el => el.open), false);
+    assert.equal(await page.locator('#settingsPanel').evaluate(el => el.open), false);
+    assert.equal(await page.locator('#diagnosticsPanel').evaluate(el => el.open), false);
+    assert.equal(await page.locator('#connectionEndpoint').innerText(), new URL(state.draft.defaultUrl).origin);
+    await page.locator('#modelTools > summary').click();
+    assert.ok(await page.locator('#import').isVisible() && await page.locator('#openMerge').isVisible());
+    await page.locator('#modelTools > summary').click();
+    const switcher = page.getByRole('button', { name: language === 'en' ? /switch/i : /切换/ });
+    await switcher.focus(); await switcher.press('Enter');
+    assert.deepEqual(await page.evaluate(() => window.messages.at(-1)), {type:'switchGroup', dirty:false});
+    await emit(page, {type:'busy',value:true,operation:'switchGroup'});
+    await page.evaluate(() => document.activeElement?.blur());
+    await emit(page, {type:'busy',value:false});
+    assert.equal(await switcher.evaluate(el => el === document.activeElement), true);
+    assert.equal(await color('#apiType', 'backgroundColor'), 'rgb(90, 91, 92)');
     assert.equal(await color('footer', 'borderTopColor'), theme === 'high-contrast' ? 'rgb(255, 238, 17)' : 'rgb(71, 72, 73)');
-    assert.equal(await color('.model-actions button', 'color'), 'rgb(11, 140, 221)');
+    assert.equal(await color('.model-actions button', 'color'), await color('main', 'color'));
     assert.equal(await color('.model-actions .danger', 'color'), 'rgb(220, 60, 65)');
     for (const width of widths) {
       try { await checkLayout(page, width, language !== 'en'); } catch (err) { throw new Error(`${language}/${theme}/${width}px: ${err.message}`, { cause: err }); }
     }
-    await page.setViewportSize({ width: 320, height: 640 }); await crud(page, language !== 'en');
+    await page.setViewportSize({ width: 320, height: 640 }); await discoveryDraft(page); await crud(page, language !== 'en');
     assert.deepEqual(problems, [], 'page errors or unexpected requests');
     console.log(`PASS ${language}/${theme}: ${widths.join(',')}px + 320px CRUD`);
   } finally { await context.close(); }

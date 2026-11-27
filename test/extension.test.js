@@ -7,7 +7,7 @@ const os = require('node:os');
 const { pathToFileURL, fileURLToPath } = require('node:url');
 const { activate, ByokTool } = require('../src/extension');
 const pkg = require('../package.json');
-const { parseGroups } = require('../src/jsonc');
+const { parseDocument, parseGroups } = require('../src/jsonc');
 const core = require('../src/core');
 
 const OPEN = 'workbench.action.openLanguageModelsJson';
@@ -343,8 +343,275 @@ test('host: mutation handler always releases busy flag and masks pending key err
   assert.deepEqual(h.state.posts.at(-1), { type: 'busy', value: false });
 });
 
+const destination = 'https://gateway.example/v1/models';
+test('discovery: real loopback catalogue through the host picker to an unsaved draft', async t => {
+  const h = await harness(t);
+  const calls = [];
+  const server = require('node:http').createServer((req, res) => {
+    calls.push([req.method, req.url, req.headers.authorization]);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'existing' }, { id: 'picked' }, { id: 'skipped' }] }));
+  });
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${server.address().port}/tenant/v1`;
+  h.tool.panel.onDidDispose = () => ({ dispose() {} });
+  h.state.inputValue = 'loopback-only';
+  h.state.pick = rows => rows.filter(row => row.label === 'picked');
+  await h.tool.handle({type: 'discoverModels', form: { apiType:'chat-completions', defaultUrl:url, noAuth:false, modelsText:'[{"id":"existing","custom":1}]' }});
+  assert.deepEqual(calls, [['GET', '/tenant/v1/models', 'Bearer loopback-only']]);
+  const change = h.state.posts.find(m => m.type === 'models');
+  assert.ok(change); const draft = parseDocument(change.text).value;
+  assert.deepEqual(draft.map(m => m.id), ['existing','picked']);
+  assert.equal(draft[0].custom, 1); assert.equal(draft[1].maxOutputTokens, undefined);
+  assert.ok(!JSON.stringify(h.state.posts).includes('loopback-only'));
+  assert.equal(h.tool.pendingKey, undefined); assert.equal(h.state.text, '[]'); assert.deepEqual(await h.backups(), []);
+});
+
+test('a replacement panel receives its ready state, not the previous panel’s input or results', async t => {
+  const h = await harness(t);
+  const nextPosts = [];
+  h.v.window.showInputBox = async () => {
+    h.tool.panel = {webview:{postMessage: async m => { nextPosts.push(m); return true; }}, reveal() {}};
+    await h.tool.handle({type:'ready'});
+    return 'already-closed-panel';
+  };
+  await h.tool.handle({type:'setKey'});
+  assert.equal(h.tool.pendingKey, undefined);
+  assert.equal(nextPosts.some(m => m.type === 'state'), true);
+  assert.equal(nextPosts.some(m => m.type === 'key'), false);
+  assert.equal(nextPosts.at(-1).value, false);
+});
+
+const fixtureKey = 'discovery-test-only-credential';
+async function discoveryHarness(t) {
+  const h = await harness(t); const { state, v, tool } = h;
+  const calls = []; const events = []; const picks = [];
+  const disposeListeners = new Set();
+  tool.panel.onDidDispose = fn => { disposeListeners.add(fn); return { dispose: () => disposeListeners.delete(fn) }; };
+  const dispose = () => { for (const fn of disposeListeners) fn(); tool.panel = undefined; };
+  const transport = {
+    modelsUrl(value) { assert.equal(value, 'https://gateway.example/v1/'); return destination; },
+    async fetchModels(url, key, { signal }) {
+      calls.push({ url, key, signal }); events.push('request');
+      return [{ id: 'existing' }, { id: 'fresh' }, { id: 'fresh', name: 'duplicate' }, { id: 'other' }];
+    }
+  };
+  tool.discovery = transport;
+  state.beforeConfirm = () => events.push('confirm');
+  v.window.showQuickPick = async (items, options) => {
+    picks.push({ items, options }); events.push('pick');
+    return state.pick ? state.pick(items) : items.filter(i => i.label === 'fresh');
+  };
+  const run = overrides => tool.handle({ type: 'discoverModels', form: { defaultUrl: 'https://gateway.example/v1/',
+    modelsText: '[]', apiType: 'responses', noAuth: false, ...overrides } });
+  const models = () => state.posts.find(m => m.type === 'models');
+  return { ...h, run, models, events, calls, picks, dispose, transport };
+}
+
+test('discovery: confirms exact destination and pending bearer before GET; appends only selected unique IDs to the JSONC draft', async t => {
+  const h = await discoveryHarness(t); h.tool.pendingKey = fixtureKey;
+  const existing = '{ "id" : "existing", "manual": 42 }';
+  await h.run({ modelsText: '[ // my draft\r\n' + existing + ', /* keep */\r\n] // footer' });
+  assert.deepEqual(h.events, ['confirm', 'request', 'pick']);
+  assert.equal(h.state.dialogs[0].options.modal, true); assert.ok(h.state.dialogs[0].options.detail.includes(destination));
+  assert.match(h.state.dialogs[0].options.detail, /Bearer/i);
+  assert.equal(h.calls[0].url, destination); assert.equal(h.calls[0].key, fixtureKey); assert.equal(h.calls[0].signal.aborted, false);
+  assert.equal(h.picks[0].options.canPickMany, true); assert.deepEqual(h.picks[0].items.map(i => i.label), ['fresh', 'other']);
+  const text = h.models().text; assert.ok(text.includes(existing) && text.includes('// my draft') && text.includes('/* keep */') && text.endsWith('// footer'));
+  assert.deepEqual(parseDocument(text).value, [{ id: 'existing', manual: 42 }, { id: 'fresh' }]);
+  assert.match(h.state.posts.findLast(p => p.type === 'notice').text, /maxOutputTokens/);
+  assert.equal(h.tool.pendingKey, fixtureKey); assert.equal(h.state.inputOptions, undefined);
+  assert.deepEqual(h.state.commands, []); assert.equal(h.state.text, '[]'); assert.deepEqual(await h.backups(), []);
+  assert.equal(h.state.secrets.size, 0); assert.equal(h.state.settings.size, 0);
+  assert.ok(!JSON.stringify([h.state.posts, h.state.dialogs, h.picks]).includes(fixtureKey));
+});
+
+test('discovery: explicit no-auth ignores pending key; one-shot input is masked, never saved or echoed on transport failure', async t => {
+  const h = await discoveryHarness(t); h.tool.pendingKey = fixtureKey;
+  await h.run({ noAuth: true, apiType: 'chat-completions' });
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0].key, undefined); assert.equal(h.state.inputOptions, undefined);
+  assert.match(h.state.dialogs[0].options.detail, /不发送|不使用|without|no authorization/i); assert.equal(h.tool.pendingKey, fixtureKey);
+  h.tool.pendingKey = undefined; h.state.inputValue = fixtureKey; h.state.posts = [];
+  let received; h.transport.fetchModels = async (_, key) => { received = key; throw new Error('raw response body: ' + key); };
+  await h.run(); assert.equal(received, fixtureKey); assert.equal(h.state.inputOptions.password, true);
+  assert.ok(h.state.lastError); assert.doesNotMatch(JSON.stringify([h.state.posts, h.state.lastError, h.state.dialogs]), /discovery-test-only-credential|raw response body/);
+  assert.equal(h.tool.pendingKey, undefined); assert.equal(h.models(), undefined); assert.equal(h.tool.busy, false);
+});
+
+test('discovery: reports sanitized provider errors without exposing the raw response', async t => {
+  const h = await discoveryHarness(t); const { DiscoveryError } = require('../src/discovery');
+  h.tool.pendingKey = fixtureKey;
+  h.transport.fetchModels = async () => { throw new DiscoveryError(401); };
+  await h.run(); assert.match(h.state.lastError, /401/); assert.equal(h.models(), undefined);
+});
+
+test('discovery: reflected credentials in model strings are not offered or posted', async t => {
+  const h = await discoveryHarness(t); h.state.inputValue = fixtureKey;
+  h.transport.fetchModels = async () => [{ id: 'prefix-' + fixtureKey }, { id: 'id', name: fixtureKey }, { id: 'fresh' }];
+  await h.run(); assert.deepEqual(h.picks[0].items.map(i => i.label), ['fresh']);
+  assert.ok(!JSON.stringify([h.picks, h.state.posts, h.state.dialogs]).includes(fixtureKey));
+});
+
+test('discovery: cancelled confirmation, key prompt and selection never apply a draft', async t => {
+  const h = await discoveryHarness(t); h.state.cancel = true;
+  await h.run(); assert.deepEqual(h.events, ['confirm']); assert.equal(h.state.inputOptions, undefined);
+  h.state.cancel = false; await h.run(); assert.equal(h.state.inputOptions.password, true); assert.equal(h.calls.length, 0);
+  h.state.pick = () => undefined; await h.run({ noAuth: true }); assert.equal(h.picks.length, 1); assert.equal(h.models(), undefined);
+});
+
+test('discovery: rejects invalid draft, protocol, full list, and missing permissions before confirmation', async t => {
+  const h = await discoveryHarness(t);
+  for (const opts of [{ apiType: 'messages' }, { modelsText: '{}' }, { modelsText: '[bad' }, { modelsText: '[{"id":" a"},{"id":"a"}]' },
+    { modelsText: JSON.stringify(Array.from({ length: 300 }, (_, n) => ({ id: String(n) }))) }]) {
+    h.state.lastError = undefined; await h.run(opts); assert.ok(h.state.lastError);
+  }
+  h.v.workspace.isTrusted = false; h.state.lastError = undefined; await h.run(); assert.ok(h.state.lastError); h.v.workspace.isTrusted = true;
+  h.v.env.uiKind = 2; h.state.lastError = undefined; await h.run(); assert.ok(h.state.lastError); h.v.env.uiKind = 1;
+  h.state.settings.set('chat.disableAIFeatures', true); h.state.lastError = undefined; await h.run(); assert.ok(h.state.lastError);
+  assert.deepEqual(h.events, []);
+});
+
+test('discovery: rejects references and raw line breaks in pending and one-shot credentials', async t => {
+  const h = await discoveryHarness(t);
+  for (const key of ['${input:chat.lm.secret.fixture}', 'test-key\n', '\rtest-key']) {
+    for (const pending of [true, false]) {
+      h.tool.pendingKey = pending ? key : undefined; h.state.inputValue = pending ? undefined : key;
+      h.state.lastError = undefined; await h.run(); assert.ok(h.state.lastError); assert.equal(h.tool.pendingKey, pending ? key : undefined);
+    }
+  }
+  assert.equal(h.calls.length, 0); assert.equal(h.models(), undefined);
+});
+
+test('discovery: rejects selection exceeding 300 rather than partially appending', async t => {
+  const h = await discoveryHarness(t); h.state.pick = items => items;
+  await h.run({ noAuth: true, modelsText: JSON.stringify(Array.from({ length: 299 }, (_, n) => ({ id: String(n) }))) });
+  assert.equal(h.picks.length, 1); assert.match(h.state.lastError, /300/); assert.equal(h.models(), undefined);
+});
+
+test('discovery: duplicate clicks ignored; disposing during confirmation, input, request, or picker prevents stale results', async t => {
+  for (const stage of ['confirmation', 'input', 'request', 'picker']) {
+    const h = await discoveryHarness(t); let signal, requests = 0;
+    h.state.beforeConfirm = async () => { await h.run(); if (stage === 'confirmation') h.dispose(); };
+    h.v.window.showInputBox = async () => { if (stage === 'input') h.dispose(); return fixtureKey; };
+    h.transport.fetchModels = async (_, __, options) => { signal = options.signal; requests++; if (stage === 'request') h.dispose(); return [{ id: 'fresh' }]; };
+    h.state.pick = items => { if (stage === 'picker') h.dispose(); return items; };
+    await h.run(); assert.equal(h.state.dialogs.length, 1); assert.equal(requests, ['request', 'picker'].includes(stage) ? 1 : 0);
+    if (requests) assert.equal(signal.aborted, true);
+    assert.equal(h.models(), undefined); assert.equal(h.state.lastError, undefined); assert.equal(h.tool.busy, false);
+  }
+});
+
 const preset = {name:'custom',vendor:'customendpoint',apiType:'chat-completions',models:[{...sampleModel(),id:'first-model',name:'First model'}]};
 const lastDraft = h => h.state.posts.filter(p => p.type === 'state').at(-1).draft;
+
+const switchTarget = { ...preset, name: 'Second Group', models: [], apiKey: '${input:chat.lm.secret.picker-fixture}', requestHeaders: { Authorization: 'private-header' } };
+async function switchHarness(t, edition) {
+  const h = await harness(t, JSON.stringify([preset]), edition);
+  h.tool.panel.active = true;
+  await h.tool.refresh();
+  await h.external(JSON.stringify([preset, switchTarget, { ...preset, vendor: 'unrelated' }, { ...preset, name: core.TEMP_PREFIX + 'hidden' }]));
+  h.state.posts.length = 0;
+  const run = (dirty, extra) => h.tool.handle({ type: 'switchGroup', dirty, ...extra }, h.tool.panel);
+  return { ...h, run };
+}
+for (const edition of ['public', 'enterprise']) test(`switchGroup: ${edition} picks a fresh profile group by its exact name without writing`, async t => {
+  const h = await switchHarness(t, edition === 'enterprise' ? sampleEdition() : undefined);
+  const { setLocale } = require('../src/i18n'); setLocale(edition === 'public' ? 'en' : 'zh-cn');
+  let rows, options;
+  h.v.window.showQuickPick = async (items, opts) => { rows = items; options = opts; return rows[1]; };
+  const before = h.state.text;
+  await h.run(false, { name: 'untrusted', groups: ['forged'] });
+  assert.deepEqual(rows?.map(r => r.label), [preset.name, switchTarget.name]);
+  assert.notEqual(options.canPickMany, true);
+  assert.match(rows[0].description, /1/); assert.match(rows[1].description, /0/);
+  const current = edition === 'public' ? /current/i : /当前/;
+  assert.match(JSON.stringify(rows[0]), current); assert.doesNotMatch(JSON.stringify(rows[1]), current);
+  assert.doesNotMatch(JSON.stringify(rows), /picker-fixture|private-header|first-model/);
+  assert.equal(h.state.dialogs.length, 0); assert.equal(lastDraft(h).name, switchTarget.name);
+  assert.equal(h.tool.baseline.group.apiKey, switchTarget.apiKey); assert.equal(h.state.text, before);
+  assert.deepEqual(await h.backups(), []); assert.equal(h.state.secrets.size, 0); assert.equal(h.state.settings.size, 0);
+});
+test('switchGroup: can switch from a preset draft to the saved group with the same name', async t => {
+  const h = await switchHarness(t, sampleEdition());
+  await h.tool.refresh(null, 'preset');
+  h.state.pick = rows => rows.find(row => row.label === preset.name);
+  await h.run(true);
+  assert.equal(h.state.dialogs.length, 1);
+  assert.equal(h.state.posts.findLast(m => m.type === 'state').draftKind, 'existing');
+});
+test('switchGroup: discard confirmation is only for a different group with edits or a pending key', async t => {
+  const h = await switchHarness(t), original = h.tool.baseline;
+  h.tool.pendingKey = 'pending-fixture';
+  for (const choice of [undefined, preset.name]) {
+    h.state.pick = rows => rows.find(r => r.label === choice);
+    await h.run(true); assert.equal(h.state.dialogs.length, 0); assert.equal(h.tool.pendingKey, 'pending-fixture');
+  }
+  h.state.pick = rows => rows[1]; h.state.cancel = true;
+  await h.run(false); assert.equal(h.state.dialogs.length, 1); assert.equal(h.state.dialogs[0].options.modal, true);
+  assert.equal(h.tool.pendingKey, 'pending-fixture'); assert.equal(h.tool.baseline, original);
+  h.tool.pendingKey = undefined; await h.run(true); assert.equal(h.state.dialogs.length, 2);
+  assert.equal(h.tool.baseline, original); assert.ok(!h.state.posts.some(m => m.type === 'state'));
+  h.tool.pendingKey = 'pending-fixture'; h.state.cancel = false; await h.run(true);
+  assert.equal(lastDraft(h).name, switchTarget.name); assert.equal(h.tool.pendingKey, undefined);
+  assert.doesNotMatch(JSON.stringify([h.state.dialogs, h.state.posts]), /pending-fixture|private-header|picker-fixture/);
+});
+for (const failure of ['removed', 'unreadable']) test(`switchGroup: ${failure} target after confirmation preserves the old draft and key`, async t => {
+  const h = await switchHarness(t), baseline = h.tool.baseline, template = h.tool.template;
+  h.tool.pendingKey = 'pending-fixture'; h.state.pick = rows => rows[1];
+  h.state.beforeConfirm = async () => { if (failure === 'removed') await h.external(JSON.stringify([preset])); else h.state.dirty = true; };
+  await h.run(false);
+  assert.ok(h.state.lastError); assert.equal(h.tool.baseline, baseline); assert.equal(h.tool.template, template);
+  assert.equal(h.tool.pendingKey, 'pending-fixture'); assert.ok(!h.state.posts.some(m => m.type === 'state'));
+});
+for (const stage of ['initial read', 'picker', 'confirmation', 'reload read']) test(`switchGroup: replacement during ${stage} never receives stale draft or loses its key`, async t => {
+  const h = await switchHarness(t), nextPosts = [];
+  const replace = () => {
+    h.tool.panel = { active: true, webview: { postMessage: async m => { nextPosts.push(m); return true; } }, reveal() {} };
+    h.tool.pendingKey = 'replacement-key';
+  };
+  const read = h.tool.readConfig.bind(h.tool); let reads = 0, picks = 0;
+  h.tool.readConfig = async () => {
+    ++reads; const result = await read();
+    if (stage === 'initial read' && reads === 1 || stage === 'reload read' && reads === 2) replace();
+    return result;
+  };
+  h.state.pick = rows => { ++picks; if (stage === 'picker') replace(); return rows[1]; };
+  h.state.beforeConfirm = () => { if (stage === 'confirmation') replace(); };
+  await h.run(true);
+  assert.equal(reads, stage === 'reload read' ? 2 : 1); assert.equal(picks, stage === 'initial read' ? 0 : 1);
+  assert.equal(h.state.dialogs.length, ['confirmation', 'reload read'].includes(stage) ? 1 : 0);
+  assert.deepEqual(nextPosts, []); assert.equal(h.tool.pendingKey, 'replacement-key'); assert.equal(h.tool.baseline.name, preset.name);
+});
+test('switchGroup: disposing the panel dismisses its outstanding native picker', async t => {
+  const h = await switchHarness(t); let finishPick, started, onDispose, cancelled = false;
+  const opened = new Promise(resolve => { started = resolve; });
+  h.tool.panel.onDidDispose = listener => { onDispose = listener; return { dispose() {} }; };
+  h.v.CancellationTokenSource = class {
+    token = { onCancellationRequested: fn => { finishPick = fn; } };
+    cancel() { cancelled = true; finishPick(); }
+    dispose() {}
+  };
+  h.v.window.showQuickPick = (_, __, token) => new Promise(resolve => {
+    finishPick = resolve; token?.onCancellationRequested(resolve); started();
+  });
+  const switching = h.run(false); await opened;
+  try {
+    h.tool.panel = undefined; onDispose?.();
+    assert.equal(cancelled, true);
+  } finally { finishPick(); await switching; }
+  assert.equal(h.tool.busy, false); assert.ok(!h.state.posts.some(m => m.type === 'state'));
+});
+test('switchGroup: malformed requests and absent or inactive panels cannot open the picker', async t => {
+  const h = await switchHarness(t); let picks = 0;
+  h.state.pick = () => { ++picks; }; await h.run('false');
+  await h.tool.handle({ type: 'switchGroup', dirty: false });
+  await h.tool.handle({ type: 'switchGroup', dirty: false }, { active: true });
+  h.tool.panel.active = false; h.state.posts.length = 0; await h.run(false);
+  assert.deepEqual(h.state.posts, [{type:'busy',value:false}]);
+  h.tool.panel = undefined; await h.run(false);
+  assert.equal(picks, 0); assert.equal(h.state.dialogs.length, 0);
+});
 
 test('host: explicit refresh does not replace a draft, baseline, or pending key on read failure', async t => {
   const h = await harness(t, JSON.stringify([preset]));

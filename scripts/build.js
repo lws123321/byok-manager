@@ -8,7 +8,7 @@ const core = require('../src/core');
 const ROOT = path.resolve(__dirname, '..');
 const sharedGuide = ['provider', 'model', 'save'].flatMap(s => ['en', 'zh-cn'].map(l => `media/guide/${s}-${l}.png`));
 const runtimeFiles = Object.freeze([
-  'src/extension.js', 'src/core.js', 'src/i18n.js', 'src/jsonc.js',
+  'src/extension.js', 'src/discovery.js', 'src/core.js', 'src/i18n.js', 'src/jsonc.js',
   'media/app.js', 'media/index.html', 'media/index.zh-cn.html', 'media/style.css', 'media/key.svg', 'media/icon.png', ...sharedGuide,
   'package.json', 'package.nls.json', 'package.nls.zh-cn.json', 'README.md', 'README.zh-CN.md', 'LICENSE.txt', 'CHANGELOG.md', 'SECURITY.md', 'SUPPORT.md'
 ]);

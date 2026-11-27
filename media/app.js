@@ -3,8 +3,8 @@
   const vscode = acquireVsCodeApi();
   const tr = (zh, en) => document.documentElement.lang.toLowerCase().startsWith('zh') ? zh : en;
   const el = id => document.getElementById(id);
-  let busy = false;
-  let operation = '', selected = '', draftKind = '', hasPendingKey = false, baseline;
+  let busy = false, trigger = null;
+  let operation = '', selected = '', draftKind = '', groups = [], hasPendingKey = false, baseline;
   let dirty = false, readFailed = false, operationResult = false, auxiliaryChosen = false;
   function renderStatus() {
     const state = !busy ? (dirty ? 'dirty' : 'clean') : operation === 'apply' ? 'saving' : 'busy';
@@ -15,6 +15,15 @@
     const status = el('saveState');
     status.dataset.state = state;
     if (status.textContent !== labels[state]) status.textContent = labels[state];
+    const discoveryReason = !el('defaultUrl').value.trim() ? tr('获取列表需要默认接口地址。', 'Enter a default URL to fetch models.')
+      : !['responses', 'chat-completions'].includes(el('apiType').value) ? tr('获取列表需要 Responses 或 Chat Completions 协议。', 'Fetching models requires Responses or Chat Completions.') : '';
+    el('discoverModels').disabled = busy || Boolean(discoveryReason);
+    el('discoveryHint').textContent = discoveryReason;
+    el('discoveryHint').hidden = !discoveryReason;
+    el('switchGroup').disabled = busy || !groups.length;
+    el('connectionEndpoint').textContent = endpointLabel();
+    el('connectionProtocol').textContent = protocolLabels.get(el('apiType').value) || tr('未设置', 'Not set');
+    renderKeyStatus();
     el('apply').disabled = busy || readFailed;
     el('apply').textContent = state === 'saving' ? labels.saving : tr('备份并写入', 'Save with Backup');
   }
@@ -31,6 +40,10 @@
   }
   function send(type, rest = {}) {
     if (busy || (type === 'apply' && readFailed)) return;
+    trigger = document.activeElement?.tagName === 'BUTTON' ? document.activeElement : null;
+    if (['import', 'export', 'validate', 'refresh'].includes(type) && el('modelTools').open) {
+      trigger = closeTools();
+    }
     operationResult = false;
     lock(type);
     notice('');
@@ -47,8 +60,41 @@
   function notice(text, kind = 'info') {
     const node = el('notice'); node.textContent = text; node.className = 'notice ' + kind; node.hidden = !text;
   }
-  function keyStatus(pending) {
-    el('keyStatus').textContent = el('noAuth').checked ? tr('保存时不使用 API Key。', 'Save without an API key.') : pending ? tr("已录入新密钥，待保存", "New key entered; pending save") : tr("未录入新密钥；保存时需要同名组已有密钥。", "No new key entered. A local key for the same group is required to save.");
+  const protocolLabels = new Map([['responses', 'Responses'], ['chat-completions', 'Chat Completions'], ['messages', 'Messages']]);
+  function endpointLabel() {
+    const url = el('defaultUrl').value.trim();
+    if (!url) {
+      return displayedModels?.some(model => typeof model.url === 'string' && model.url.trim())
+        ? tr('按模型设置', 'Per-model URLs') : tr('未设置', 'Not set');
+    }
+    try {
+      const parsed = new URL(url);
+      // Never reflect credentials, paths, query strings, or invalid pasted input in the header.
+      if (['http:', 'https:'].includes(parsed.protocol) && parsed.host) return parsed.origin;
+    } catch { /* An incomplete URL is normal while typing. */ }
+    return tr('地址无效', 'Invalid URL');
+  }
+  function renderKeyStatus() {
+    const noAuth = el('noAuth').checked, target = el('name').value.trim();
+    const reusable = !readFailed && groups.some(group => group.name === target && group.hasKey === true);
+    const text = noAuth ? tr('保存时不使用 API Key。', 'Save without an API key.')
+      : hasPendingKey ? tr('新密钥已暂存，保存后生效。', 'New key entered; pending save.')
+      : readFailed || !draftKind ? tr('本机密钥引用状态未知。', 'Local key reference status is unknown.')
+      : reusable ? tr('上次读取时已有密钥引用，保存时可复用。', 'Local key reference found at last load; available for reuse.')
+      : tr('上次读取时，此名称下没有密钥引用。', 'No local key reference for this name at last load.');
+    el('connectionCredential').textContent = noAuth ? tr('无需密钥', 'No key needed')
+      : hasPendingKey ? tr('已暂存', 'Pending save') : readFailed || !draftKind ? tr('未知', 'Unknown')
+      : reusable ? tr('可复用', 'Reusable key') : tr('未录入', 'No key reference');
+    if (el('keyStatus').textContent !== text) el('keyStatus').textContent = text;
+    const enter = el('setKey'), clear = el('clearKey');
+    enter.textContent = reusable || hasPendingKey ? tr('替换 API Key', 'Replace API Key') : tr('录入 API Key', 'Enter API Key');
+    enter.hidden = noAuth; enter.disabled = busy || noAuth;
+    clear.hidden = !hasPendingKey; clear.disabled = busy || !hasPendingKey;
+  }
+  function renderGroupContext() {
+    const labels = { existing: tr('当前模型组', 'Current group'), new: tr('新建草稿', 'New draft'), import: tr('导入草稿', 'Imported draft'), preset: tr('预设草稿', 'Preset draft') };
+    el('groupKind').textContent = labels[draftKind];
+    el('groupName').textContent = (draftKind === 'existing' ? selected : el('name').value.trim()) || tr('未命名', 'Unnamed');
   }
   let editing = null;
   let deleteIndex = null;
@@ -73,10 +119,31 @@
       for (const m of displayedModels) if (typeof m.id === 'string' && m.id) aux.add(new Option(m.name || m.id, m.id));
       aux.value = displayedModels.some(m => m.id === previousAux) ? previousAux : '';
     }
-    el('modelCount').textContent = displayedModels ? `${displayedModels.length}${tr(" 个模型", " models")}` : '—';
+    const size = displayedModels?.length;
+    const total = size === undefined ? '—' : tr(`${size} 个模型`, `${size} ${size === 1 ? 'model' : 'models'}`);
+    el('modelCount').textContent = String(size ?? '—'); el('groupCount').textContent = total;
     renderModels();
   }
   const columns = [tr("模型 / ID", "Model / ID"), tr("协议", "Protocol"), tr("上下文 / 输出", "Context / Output"), tr("能力 / 思考档位", "Capabilities / Effort"), tr("操作", "Actions")];
+  function dismiss(details, restoreFocus = false) {
+    const summary = details.querySelector('summary');
+    details.open = false;
+    if (restoreFocus) summary.focus();
+    return summary;
+  }
+  function closeTools() { return dismiss(el('modelTools'), true); }
+  function dismissOnEscape(details) {
+    details.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || !details.open) return;
+      event.preventDefault(); event.stopPropagation(); dismiss(details, true);
+    });
+  }
+  for (const id of ['connectionEditor', 'modelTools', 'builder', 'advanced']) dismissOnEscape(el(id));
+  document.addEventListener('click', event => {
+    for (const menu of document.querySelectorAll('details.row-more[open], #modelTools[open]')) {
+      if (!menu.contains(event.target)) dismiss(menu);
+    }
+  });
   function renderModels() {
     const list = el('modelList');
     if (!displayedModels) { list.replaceChildren(node('div','empty',tr("可视化列表暂不可用", "Visual model list unavailable"))); return; }
@@ -93,7 +160,8 @@
       const name = node('div','model-name',model.name || model.id || tr("未命名模型", "Unnamed model"));
       const id = node('div','model-id',model.id || tr("缺少 ID", "Missing ID"));
       name.title = name.textContent; id.title = id.textContent; body.append(name, id);
-      const protocol = node('td','model-protocol', ({'chat-completions':'Chat Completions', responses:'Responses', messages:'Messages'})[model.apiType || el('apiType').value] || String(model.apiType || el('apiType').value));
+      const apiType = model.apiType || el('apiType').value;
+      const protocol = node('td', 'model-protocol', protocolLabels.get(apiType) || String(apiType));
       if (!model.apiType) protocol.append(node('div','model-id',tr("继承组协议", "Inherited protocol")));
       const meta = node('td','model-meta');
       meta.append(node('span','',number(model.contextWindow)),node('span','model-id',tr("输出 ", "Output ")+number(model.maxOutputTokens)));
@@ -101,20 +169,29 @@
       const caps = node('td','model-cap');
       const supported = [['toolCalling',tr("工具", "Tools")],['vision',tr("视觉", "Vision")],['thinking',tr("思考", "Reasoning")]].filter(([key])=>model[key]===true).map(([,label])=>label);
       caps.append(node('div','',supported.join(' · ') || '—'));
-      if (Array.isArray(model.supportsReasoningEffort) && model.supportsReasoningEffort.length) caps.append(node('div','model-id',model.supportsReasoningEffort.join(' / ')));
-      const actions = node('td','model-actions');
+      if (Array.isArray(model.supportsReasoningEffort) && model.supportsReasoningEffort.length) {
+        const levels = model.supportsReasoningEffort, effort = node('details', 'model-effort');
+        effort.append(node('summary', '', tr(`${levels.length} 档`, `${levels.length} ${levels.length === 1 ? 'level' : 'levels'}`)), node('div', 'model-id', levels.join(' / ')));
+        caps.append(effort);
+      }
+      const actions = node('td','model-actions'), more = node('details', 'row-more');
+      const summary = node('summary', '', tr('更多…', 'More…')), secondary = node('div', 'row-more-actions');
+      const targetName = model.name || model.id || tr('模型', 'Model');
+      summary.setAttribute('aria-label', tr(`${targetName} 的更多操作`, `More actions for ${targetName}`));
+      more.append(summary, secondary); dismissOnEscape(more);
       for (const [label, mode] of [[tr("编辑", "Edit"),'edit'],[tr("复制", "Copy"),'copy'],[tr("删除", "Delete"),'delete']]) {
-        const b = node('button','row-action'+(mode==='delete'?' danger':''),label); b.type='button'; b.disabled = busy; b.setAttribute('aria-label',`${label} ${model.name || model.id || tr("模型", "Model")}`);
+        const b = node('button','row-action'+(mode==='delete'?' danger':''),label); b.type='button'; b.disabled = busy; b.setAttribute('aria-label',`${label} ${targetName}`);
         b.addEventListener('click', () => {
           if (busy) return;
+          if (mode !== 'edit') dismiss(more, true);
           if (mode !== 'delete') { openEditor(mode, i); return; }
           deleteIndex = i;
-          const target = model.name || model.id || tr('该模型', 'this model');
-          el('deleteDescription').textContent = tr(`确认移除 ${target}？`, `Remove ${target}?`);
+          el('deleteDescription').textContent = tr(`确认移除 ${targetName}？`, `Remove ${targetName}?`);
           el('deleteDialog').showModal();
         });
-        actions.append(b);
+        (mode === 'edit' ? actions : secondary).append(b);
       }
+      actions.append(more);
       const cells = [body, protocol, meta, caps, actions];
       cells.forEach((cell, index) => { cell.dataset.label = columns[index]; });
       row.append(...cells); tbody.append(row);
@@ -168,7 +245,9 @@
       if (model.contextWindow && (model.contextWindow<=model.maxOutputTokens || (model.maxInputTokens && model.maxInputTokens+model.maxOutputTokens>model.contextWindow))) throw new Error(tr("总上下文必须大于输出，且不能小于输入与输出之和。", "Total context must exceed output and be at least input plus output."));
       const e=efforts(); set('supportsReasoningEffort',e.length?e:(Array.isArray(base.supportsReasoningEffort)&&base.supportsReasoningEffort.length===0?[]:undefined));
       if(mode==='edit') models[index]=model; else models.push(model);
-      el('searchModels').value=''; setModels(models); el('modelDialog').close(); notice(dirty ? tr("模型已修改，尚未保存。", "Model changed; not saved.") : '');
+      el('searchModels').value=''; setModels(models); el('modelDialog').close();
+      el('modelList').querySelectorAll('.model-actions')[mode === 'edit' ? index : models.length - 1]?.querySelector('button')?.focus();
+      notice(dirty ? tr("模型已修改，尚未保存。", "Model changed; not saved.") : '');
     } catch(e) {fieldError('editorError',e.message);}
   });
   el('cancelDelete').addEventListener('click',()=>el('deleteDialog').close());
@@ -176,15 +255,16 @@
   el('confirmDelete').addEventListener('click', () => {
     if (deleteIndex === null || busy) return;
     const models = readModels(); models.splice(deleteIndex, 1); setModels(models);
-    el('deleteDialog').close(); notice(dirty ? tr('模型已移除，尚未保存。', 'Model removed; not saved.') : '');
+    el('deleteDialog').close(); el('searchModels').focus();
+    notice(dirty ? tr('模型已移除，尚未保存。', 'Model removed; not saved.') : '');
   });
-  el('noAuth').addEventListener('change', () => keyStatus(hasPendingKey));
+  el('name').addEventListener('input', renderGroupContext);
   el('searchModels').addEventListener('input',renderModels);
   el('apiType').addEventListener('change',renderModels);
   for (const id of ['name', 'defaultUrl']) el(id).addEventListener('input', updateDirty);
   el('auxiliaryModel').addEventListener('change', () => { auxiliaryChosen = true; });
   for (const id of ['apiType', 'auxiliaryModel', 'noAuth', 'stateless', 'applyRecommendedSettings', 'overwriteRecommendedSettings']) el(id).addEventListener('change', updateDirty);
-  el('openMerge').addEventListener('click',()=>{try {readModels(); el('mergeText').value='';el('replaceDuplicates').checked=false;fieldError('mergeError','');el('mergeDialog').showModal();}catch{notice(tr("请先格式化或修复当前 JSONC。", "Format or fix the current JSONC first."),'error');}});
+  el('openMerge').addEventListener('click',()=>{try {readModels(); el('mergeText').value='';el('replaceDuplicates').checked=false;fieldError('mergeError','');closeTools();el('mergeDialog').showModal();}catch{notice(tr("请先格式化或修复当前 JSONC。", "Format or fix the current JSONC first."),'error');}});
   for(const id of ['closeMerge','cancelMerge']) el(id).addEventListener('click',()=>{if(!busy)el('mergeDialog').close();});
   el('mergeDialog').addEventListener('cancel',e=>{if(busy)e.preventDefault();});
   el('mergeModels').addEventListener('click',()=>{if(busy)return;mergePending=true;fieldError('mergeError','');send('mergeModels',{form:form(),incomingText:el('mergeText').value,replace:el('replaceDuplicates').checked});});
@@ -198,17 +278,29 @@
       } else {
         if (!operationResult && operation === 'apply') notice(tr('已取消保存。', 'Save cancelled.'));
         if (!operationResult && operation === 'restore') notice(tr('已取消恢复。', 'Restore cancelled.'));
+        const completed = operation;
         lock(''); mergePending = false;
-        el('providers').value = selected;
+        let target = trigger;
+        if (completed === 'switchGroup') target = el(el('switchGroup').disabled ? 'refresh' : 'switchGroup');
+        if (completed === 'discoverModels') target = el('discoverModels').disabled ? el('connectionEditor').querySelector('summary') : el('discoverModels');
+        if (completed === 'clearKey' && el('clearKey').hidden) target = el(el('setKey').hidden ? 'noAuth' : 'setKey');
+        if (completed === 'mergeModels' && !el('mergeDialog').open) target = el('modelTools').querySelector('summary');
+        // A native disclosure can still be navigated while form controls are locked.
+        const active = document.activeElement;
+        if (target && !target.disabled && !target.hidden && (!active || active === document.body || active === trigger || active === target)) target.focus();
+        trigger = null;
       }
     } else if (message.type === 'notice') {
       operationResult = true; notice(message.text, message.kind);
       if (operation === 'refresh' && message.kind === 'error') readFailed = true;
       if (mergePending && message.kind === 'error') fieldError('mergeError', message.text);
     }
-    else if (message.type === 'models') { el('modelsText').value = message.text; modelsChanged(); }
+    else if (message.type === 'models') {
+      if (operation === 'discoverModels') el('searchModels').value = '';
+      el('modelsText').value = message.text; modelsChanged();
+    }
     else if (message.type === 'merged') { el('modelsText').value=message.text; el('searchModels').value='';modelsChanged();el('mergeDialog').close();mergePending=false; }
-    else if (message.type === 'key') { hasPendingKey = message.pending === true; keyStatus(hasPendingKey); updateDirty(); }
+    else if (message.type === 'key') { hasPendingKey = message.pending === true; updateDirty(); }
     else if (message.type === 'state') {
       const env = message.env;
       const ok = env.openJson && env.provider && env.trusted && env.desktop && !env.aiDisabled;
@@ -218,22 +310,23 @@
       readFailed = Boolean(message.error);
       if (readFailed && baseline && ['refresh', 'apply', 'restore'].includes(operation)) {
         // A failed read supplied a fallback template, not a fresh disk baseline.
-        hasPendingKey = message.hasPendingKey === true; keyStatus(hasPendingKey);
+        hasPendingKey = message.hasPendingKey === true;
         notice(message.error, 'error'); updateDirty(); return;
       }
-      el('providers').replaceChildren(new Option(tr("新建模型组", "New model group"), ''));
-      for (const group of message.groups) el('providers').add(new Option(`${group.name} · ${group.count}${tr(" 个模型", " models")}${group.hasKey ? tr(" · 有密钥引用", " · Key reference present") : ''}`, group.name));
-      selected = message.selected || ''; el('providers').value = selected;
+      groups = message.groups;
+      selected = message.selected || '';
       draftKind = message.draftKind || (selected ? 'existing' : 'new');
+      el('connectionEditor').open = draftKind !== 'existing';
       for (const id of ['modelDialog', 'deleteDialog', 'mergeDialog']) if (el(id).open) el(id).close();
       for (const key of ['name', 'apiType', 'defaultUrl', 'modelsText']) el(key).value = message.draft[key];
+      renderGroupContext();
       auxiliaryChosen = operation === 'editionPreset' && auxiliaryChosen;
       const desiredAuxiliary = auxiliaryChosen ? el('auxiliaryModel').value : message.draft.auxiliaryModel;
       el('searchModels').value = '';
       for (const id of ['noAuth', 'stateless', 'applyRecommendedSettings', 'overwriteRecommendedSettings']) {
         const checkbox = el(id); checkbox.checked = checkbox.defaultChecked;
       }
-      hasPendingKey = message.hasPendingKey === true; keyStatus(hasPendingKey); count();
+      hasPendingKey = message.hasPendingKey === true; count();
       el('auxiliaryModel').value = displayedModels?.some(m => m.id === desiredAuxiliary) ? desiredAuxiliary : '';
       baseline = form(); updateDirty();
       el('configPath').textContent = message.configPath;
@@ -245,10 +338,15 @@
   }
   // EDITION_PRESET_ACTION
   for (const type of ['export', 'validate', 'apply']) el(type).addEventListener('click', () => send(type, { form: form() }));
-  el('refresh').addEventListener('click', () => { notice(''); send('refresh', { name: el('providers').value || null }); });
-  el('providers').addEventListener('change', () => { notice(''); send(el('providers').value ? 'refresh' : 'new', { name: el('providers').value }); });
+  el('refresh').addEventListener('click', () => send('refresh', { name: selected || null }));
+  el('switchGroup').addEventListener('click', () => { if (!el('switchGroup').disabled) send('switchGroup', { dirty }); });
   el('format').addEventListener('click', () => send('format', { modelsText: el('modelsText').value }));
   el('modelsText').addEventListener('input', modelsChanged);
+  el('discoverModels').addEventListener('click', () => {
+    if (el('discoverModels').disabled) return;
+    const { defaultUrl, apiType, modelsText, noAuth } = form();
+    send('discoverModels', { form: { defaultUrl, apiType, modelsText, noAuth } });
+  });
   el('syncUrl').addEventListener('click', () => {
     try {
       const models = JSON.parse(el('modelsText').value);

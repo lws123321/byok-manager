@@ -170,7 +170,7 @@ async function run(tmp) {
     await welcome.waitFor({ state: 'detached' });
   });
   const installed = cli(ui, '--list-extensions', '--show-versions').trim().split(/\r?\n/).find(s => s.includes(`.${pkg.name}@`));
-  assert.ok(installed, 'installed candidate identity and version');
+  assert.equal(installed, `${pkg.publisher}.${pkg.name}@${pkg.version}`, 'installed candidate identity and version');
   await desktop(ui, 'en', async page => {
     await palette(page, 'BYOK: ' + texts('en')['command.openGuide'], false);
     await noGuide(page, 'restart with walkthrough explicitly closed');

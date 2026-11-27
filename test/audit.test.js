@@ -9,7 +9,7 @@ const audit = () => require('../scripts/audit');
 const root = path.resolve(__dirname, '..');
 const { zip, manifest } = require('../scripts/package');
 const pkg = { ...require('../package.json'), publisher: 'asong-dev' };
-const baseFiles = ['package.nls.json','package.nls.zh-cn.json','README.md','README.zh-CN.md','SECURITY.md','SUPPORT.md','LICENSE.txt','CHANGELOG.md','media/app.js','media/style.css','media/index.html','media/index.zh-cn.html','media/key.svg','media/icon.png','src/core.js','src/extension.js','src/i18n.js','src/jsonc.js', ...['en','zh-cn'].flatMap(l => ['provider','model','save'].map(s => `media/guide/${s}-${l}.png`))];
+const baseFiles = ['package.nls.json','package.nls.zh-cn.json','README.md','README.zh-CN.md','SECURITY.md','SUPPORT.md','LICENSE.txt','CHANGELOG.md','media/app.js','media/style.css','media/index.html','media/index.zh-cn.html','media/key.svg','media/icon.png','src/core.js','src/discovery.js','src/extension.js','src/i18n.js','src/jsonc.js', ...['en','zh-cn'].flatMap(l => ['provider','model','save'].map(s => `media/guide/${s}-${l}.png`))];
 async function candidate(t) {
   const { dir } = await workspace(t);
   const types = { png:'image/png',svg:'image/svg+xml',md:'text/markdown',txt:'text/plain',json:'application/json',css:'text/css',js:'application/javascript',html:'text/html',vsixmanifest:'text/xml' };

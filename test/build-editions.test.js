@@ -23,7 +23,7 @@ test('public stage contains only packaged files; no enterprise UI or source conf
   await api().withStage('public', async ({ stage, pkg, files }) => {
     dir = stage;
     assert.equal(`${pkg.publisher}.${pkg.name}`, 'asong-dev.byok-manager');
-    assert.equal(pkg.version, '0.6.0'); assert.equal(pkg.scripts, undefined);
+    assert.equal(pkg.version, require('../package.json').version); assert.equal(pkg.scripts, undefined);
     assert.ok(files.includes('edition.json')); assert.ok(!files.some(f => /^(?:editions|scripts|test)\//.test(f)));
     for (const file of ['media/index.html', 'media/index.zh-cn.html', 'media/app.js']) {
       assert.doesNotMatch(await fs.readFile(path.join(stage, file), 'utf8'), /EDITION_PRESET_ACTION|loadEditionPreset/);
@@ -147,11 +147,11 @@ test('audited packagers work from a clean checkout without private inputs', asyn
   delete process.env.BYOK_ENTERPRISE_CONFIG;
   try {
     const targets = await pk.build('public',{source:true});
-    assert.equal(targets.length,2); assert.match(targets[0],/asong-dev\.byok-manager-0\.6\.0\.vsix$/);
+    assert.equal(targets.length,2); assert.equal(path.basename(targets[0]), `asong-dev.byok-manager-${require('../package.json').version}.vsix`);
     assert.deepEqual((await fs.readdir(path.dirname(targets[0]))).sort(),['SHA256SUMS.txt',...targets.map(f => path.basename(f))].sort());
     await assert.rejects(pk.build('enterprise'),/configuration/);
     const [internal] = await pk.build('enterprise',fixture);
-    assert.match(internal,/fixture-org\.fixture-manager-0\.6\.0\.vsix$/);
+    assert.equal(path.basename(internal), `fixture-org.fixture-manager-${require('../package.json').version}.vsix`);
     assert.deepEqual((await fs.readdir(path.dirname(internal))).sort(), ['SHA256SUMS.txt',path.basename(internal)].sort());
     if (process.env.BYOK_TEST_VSCE === '1') {
       await fs.symlink(path.join(root,'node_modules'),path.join(dir,'node_modules'),process.platform === 'win32' ? 'junction' : 'dir');

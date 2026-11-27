@@ -88,7 +88,7 @@ const { auditSource, verifyVsix } = require('./audit');
 const sourceFiles = Object.freeze([...runtimeFiles, 'editions/public.json', 'editions/enterprise.example.json',
   'TESTING.md','RELEASE.md','.gitignore','.vscodeignore','.vscode/launch.json',
   'scripts/audit.js','scripts/build.js','scripts/package.js','scripts/release.js',
-  'test/core.test.js','test/extension.test.js','test/release.test.js','test/webview.test.js','test/build-editions.test.js','test/audit.test.js',
+  'test/core.test.js','test/discovery.test.js','test/extension.test.js','test/release.test.js','test/webview.test.js','test/build-editions.test.js','test/audit.test.js',
   'test/browser-smoke.js','test/host-smoke.js','test/run-host-smoke.js','test/install-onboarding.js','test/compare-legacy.js','test/verify_vsix.py']);
 
 // Write/verify on the output volume; rename only verified bytes into the public-facing location.

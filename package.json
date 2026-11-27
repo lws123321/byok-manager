@@ -2,7 +2,7 @@
   "name": "byok-manager",
   "displayName": "BYOK Manager",
   "description": "%extension.description%",
-  "version": "0.6.0",
+  "version": "0.8.1",
   "publisher": "asong-dev",
   "license": "MIT",
   "engines": {
@@ -108,7 +108,7 @@
   "scripts": {
     "vscode:prepublish": "node -e \"console.error('Use the edition packaging commands, not vsce from the checkout.'); process.exit(1)\"",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/extension.js && node --check src/core.js && node --check src/jsonc.js && node --check media/app.js && node --check src/i18n.js && node --check scripts/build.js && node --check scripts/audit.js && node --check scripts/package.js && node --check scripts/release.js",
+    "check": "node --check src/extension.js && node --check src/core.js && node --check src/discovery.js && node --check src/jsonc.js && node --check media/app.js && node --check src/i18n.js && node --check scripts/build.js && node --check scripts/audit.js && node --check scripts/package.js && node --check scripts/release.js",
     "build:public": "node scripts/build.js public",
     "build:enterprise": "node scripts/build.js enterprise",
     "package": "node scripts/package.js public --source",

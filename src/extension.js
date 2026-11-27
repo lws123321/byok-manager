@@ -4,14 +4,47 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parseDocument, parseGroups } = require('./jsonc');
+const modelDiscovery = require('./discovery');
 const core = require('./core');
 const checkoutEdition = require('../editions/public.json');
 const blankGroup = () => ({ name: 'custom', vendor: core.VENDOR, apiType: 'chat-completions', models: [] });
+const isCustomGroup = group => group.vendor === core.VENDOR && !group.name.startsWith(core.TEMP_PREFIX);
+const modelCount = group => Array.isArray(group.models) ? group.models.length : 0;
 const OPEN_JSON = 'workbench.action.openLanguageModelsJson';
 const ADD_GROUP = 'lm.addLanguageModelsProviderGroup';
 const MANAGE = 'workbench.action.chat.manage';
+function assertWorkspaceAllowed({ desktop, trusted, aiDisabled }) {
+  if (!desktop) throw new Error(tr("此版本仅支持 VS Code 桌面版，不支持 vscode.dev。", "Only VS Code Desktop is supported; vscode.dev is not supported."));
+  if (!trusted) throw new Error(tr("请在可信工作区或新的本地空窗口中使用。", "Use a trusted workspace or a new local empty window."));
+  if (aiDisabled) throw new Error(tr("当前关闭了 AI 功能（chat.disableAIFeatures）。请先检查设置或组织策略，工具不会强行更改。", "AI features are disabled (chat.disableAIFeatures). Check settings or organization policy; this tool will not override them."));
+}
+function invalidDiscoveryKey(value) {
+  if (typeof value !== 'string' || !value.trim() || /[\x00-\x1f\x7f\u2028\u2029]/.test(value) || value.includes('${')) {
+    return tr('请输入实际 API Key，不要使用变量引用、换行或控制字符。', 'Enter an actual API key without variable references, line breaks, or control characters.');
+  }
+}
+function discoveryDraft(text) {
+  const root = parseDocument(text);
+  if (!Array.isArray(root.value)) throw new Error(tr('当前模型必须是数组。', 'Current models must be an array.'));
+  if (root.value.length >= 300) throw new Error(tr('草稿最多包含 300 个模型；请先移除不需要的模型。', 'A draft can contain at most 300 models. Remove models before adding more.'));
+  const ids = new Set();
+  for (const model of root.value) {
+    const id = typeof model?.id === 'string' ? model.id.trim() : '';
+    if (!id || /[\x00-\x1f\x7f]/.test(model.id) || ids.has(id)) throw new Error(tr('请先修复草稿中无效或重复的模型 ID。', 'Fix invalid or duplicate model IDs in the draft first.'));
+    ids.add(id);
+  }
+  return { root, ids };
+}
+function appendDraftModels(text, root, models) {
+  const last = root.children.at(-1);
+  // Insert before the original trailing trivia (including any comma and comments).
+  const offset = last?.end ?? root.end - 1, eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const body = models.map(m => '  ' + JSON.stringify(m, null, 2).replaceAll('\n', eol + '  ')).join(',' + eol);
+  return text.slice(0, offset) + (last ? ',' : '') + eol + body + (last ? '' : eol) + text.slice(offset);
+}
 class ByokTool {
-  constructor(vscode, context, edition = checkoutEdition) {
+  constructor(vscode, context, edition = checkoutEdition, discovery = modelDiscovery) {
+    this.discovery = discovery;
     this.edition = edition;
     setLocale(vscode.env.language);
     this.v = vscode; this.context = context; this.panel = undefined;
@@ -46,9 +79,7 @@ class ByokTool {
   }
   async ensureCompatible(needsSecret = false) {
     const env = await this.environment();
-    if (!env.desktop) throw new Error(tr("此版本仅支持 VS Code 桌面版，不支持 vscode.dev。", "Only VS Code Desktop is supported; vscode.dev is not supported."));
-    if (!env.trusted) throw new Error(tr("请在可信工作区或新的本地空窗口中使用。", "Use a trusted workspace or a new local empty window."));
-    if (env.aiDisabled) throw new Error(tr("当前关闭了 AI 功能（chat.disableAIFeatures）。请先检查设置或组织策略，工具不会强行更改。", "AI features are disabled (chat.disableAIFeatures). Check settings or organization policy; this tool will not override them."));
+    assertWorkspaceAllowed(env);
     if (!env.openJson) throw new Error(tr("当前版本没有原生模型配置入口。请更新 VS Code 并启用官方 Copilot / Chat 功能。", "The native model configuration entry point is unavailable. Update VS Code and enable official Copilot / Chat features."));
     if (!env.provider) throw new Error(tr("未找到已启用的官方 Custom Endpoint 密钥配置声明。请启用或更新官方 GitHub Copilot 扩展。", "No enabled official Custom Endpoint secret configuration found. Enable or update the official GitHub Copilot extension."));
     if (needsSecret && !env.addGroup) throw new Error(tr("当前版本没有经过核对的原生密钥写入命令。已停止；请在原生模型管理中录入 Key 后再复用。", "The native secret command is unavailable. Enter the key in native model management, then reuse it here."));
@@ -95,7 +126,7 @@ class ByokTool {
       localResourceRoots: [this.v.Uri.joinPath(this.context.extensionUri, 'media')]
     });
     const panel = this.panel;
-    const messages = panel.webview.onDidReceiveMessage(message => this.handle(message));
+    const messages = panel.webview.onDidReceiveMessage(message => this.handle(message, panel));
     panel.onDidDispose(() => { messages.dispose(); this.pendingKey = undefined; this.panel = undefined; this.baseline = undefined; });
     const html = await this.html(panel.webview);
     if (this.panel === panel) panel.webview.html = html;
@@ -110,15 +141,17 @@ class ByokTool {
       .replaceAll('{{STYLE_URI}}', webview.asWebviewUri(this.v.Uri.joinPath(this.context.extensionUri, 'media', 'style.css')).toString())
       .replaceAll('{{SCRIPT_URI}}', webview.asWebviewUri(this.v.Uri.joinPath(this.context.extensionUri, 'media', 'app.js')).toString());
   }
-  async refresh(selection, draftKind, { explicitReload = false } = {}) {
+  async refresh(selection, draftKind, { explicitReload = false, expectedPanel } = {}) {
     const env = await this.environment();
+    if (expectedPanel && this.panel !== expectedPanel) return;
     let groups = []; let error;
     try { groups = parseGroups((await this.readConfig()).text).value; }
     catch (e) {
       if (explicitReload || draftKind === 'preset') throw e;
       error = core.safeError(e, [this.pendingKey]);
     }
-    const custom = groups.filter(g => g.vendor === core.VENDOR && !g.name.startsWith(core.TEMP_PREFIX));
+    if (expectedPanel && this.panel !== expectedPanel) return;
+    const custom = groups.filter(isCustomGroup);
     const explicitPreset = draftKind === 'preset';
     const chosen = explicitPreset ? custom.find(g => g.name === this.edition.preset.name)
       : selection === null ? undefined : selection === undefined ? custom.find(g => g.name === this.edition.preset?.name) || custom[0]
@@ -132,8 +165,9 @@ class ByokTool {
     }
     const modelUrls = [...new Set((template.models || []).map(m => m.url).filter(Boolean))];
     const panel = this.panel;
-    const delivered = await this.post({ type: 'state', env, draftKind: draftKind || (usePreset ? 'preset' : chosen ? 'existing' : 'new'),
-      groups: custom.map(g => ({ name: g.name, count: Array.isArray(g.models) ? g.models.length : 0, hasKey: core.isSecretRef(g.apiKey) })),
+    const kind = draftKind || (usePreset ? 'preset' : chosen ? 'existing' : 'new');
+    const delivered = await this.post({ type: 'state', env, draftKind: kind,
+      groups: custom.map(g => ({ name: g.name, count: modelCount(g), hasKey: core.isSecretRef(g.apiKey) })),
       draft: { name: template.name || 'custom', apiType: template.apiType || 'chat-completions',
         defaultUrl: usePreset && template.url ? template.url : modelUrls.length === 1 ? modelUrls[0] : '',
         auxiliaryModel: usePreset && template.models.some(m => m.id === this.edition.auxiliaryModel) ? this.edition.auxiliaryModel : '',
@@ -142,20 +176,30 @@ class ByokTool {
       hasPendingKey: !explicitReload && !!this.pendingKey, error
     });
     if (delivered === false || panel !== this.panel) return;
-    this.template = template; this.baseline = baseline;
+    this.template = template; this.baseline = baseline; this.displayedGroup = kind === 'existing' ? chosen?.name : undefined;
     if (explicitReload) this.pendingKey = undefined;
     if (panel) panel.reveal(undefined, true);
   }
-  async handle(message) {
+  async handle(message, sourcePanel) {
     if (!message || typeof message.type !== 'string') return;
-    if (this.busy) return;
+    const panel = this.panel;
+    if (sourcePanel && sourcePanel !== panel) return;
+    if (message.type === 'switchGroup' && (!sourcePanel?.active || typeof message.dirty !== 'boolean')) {
+      if (sourcePanel && !this.busy) await sourcePanel.webview.postMessage({ type: 'busy', value: false });
+      return;
+    }
+    if (this.busy) {
+      if (message.type === 'ready' && panel) this.waitingPanel = panel;
+      return;
+    }
     this.busy = true;
     try {
       const delivered = await this.post({ type: 'busy', value: true, operation: message.type });
-      if (delivered === false) return;
+      if (delivered === false || this.panel !== panel) return;
       switch (message.type) {
         case 'ready': await this.refresh(); break;
         case 'refresh': await this.refresh(message.name ?? undefined, undefined, { explicitReload: true }); break;
+        case 'switchGroup': await this.switchGroup(message.dirty, panel); break;
         case 'editionPreset': {
           if (!this.edition.features.presetButton || !this.edition.preset) break;
           const load = this.edition.locales[isChinese() ? 'zh-cn' : 'en']['edition.loadPreset'] || tr('加载预设', 'Load Preset');
@@ -181,6 +225,7 @@ class ByokTool {
           if (!Array.isArray(models)) throw new Error(tr("模型配置必须是数组。", "Model configuration must be an array."));
           await this.post({ type: 'models', text: JSON.stringify(models, null, 2) }); break;
         }
+        case 'discoverModels': if (panel) await this.discoverModels(message.form, panel); break;
         case 'addModels': await this.addModels(message); break;
         case 'mergeModels': {
           const result = core.mergeModels(message.form, message.incomingText, message.replace === true);
@@ -203,21 +248,57 @@ class ByokTool {
         }
       }
     } catch (e) {
+      if (panel !== this.panel) return;
       const message = core.safeError(e, [this.pendingKey]);
       await this.notice(message, 'error');
-      void this.v.window.showErrorMessage('BYOK：' + message);
+      if (panel === this.panel) void this.v.window.showErrorMessage('BYOK：' + message);
     } finally {
-      this.busy = false; await this.post({ type: 'busy', value: false });
+      this.busy = false;
+      const waiting = this.waitingPanel; this.waitingPanel = undefined;
+      if (waiting && waiting !== panel && waiting === this.panel) await this.handle({type:'ready'});
+      else if (panel === this.panel) await this.post({ type: 'busy', value: false });
     }
   }
+  async switchGroup(dirty, panel) {
+    const groups = parseGroups((await this.readConfig()).text).value.filter(isCustomGroup);
+    if (panel !== this.panel) return;
+    const currentName = this.displayedGroup;
+    const items = groups.map(group => {
+      const count = modelCount(group);
+      return { label: group.name, description: `${count}${tr(' 个模型', count === 1 ? ' model' : ' models')}` +
+        (group.name === currentName ? tr(' · 当前', ' · Current') : '') };
+    });
+    if (!items.length) {
+      await this.notice(tr('当前 Profile 中没有可切换的 Custom Endpoint 模型组。', 'This profile has no Custom Endpoint groups to switch to.'));
+      return;
+    }
+    const prompts = this.v.CancellationTokenSource ? new this.v.CancellationTokenSource() : undefined;
+    const disposed = prompts && panel.onDidDispose(() => prompts.cancel());
+    let picked;
+    try {
+      picked = await this.v.window.showQuickPick(items, { canPickMany: false,
+        title: tr('切换模型组', 'Switch Model Group'), placeHolder: tr('输入名称搜索模型组', 'Type a group name to search') }, prompts?.token);
+    } finally { disposed?.dispose(); prompts?.dispose(); }
+    if (panel !== this.panel || !picked || picked.label === currentName) return;
+    if (dirty || this.pendingKey) {
+      const action = tr('切换', 'Switch');
+      const answer = await this.v.window.showWarningMessage(tr('切换模型组并放弃未保存的更改？', 'Switch groups and discard unsaved changes?'), {
+        modal: true, detail: tr('当前草稿和暂存的 API Key 将被替换，不会修改本机配置。', 'Switching replaces this draft and discards its pending API key. Local configuration will not change.')
+      }, action);
+      if (panel !== this.panel || answer !== action) return;
+    }
+    await this.refresh(picked.label, undefined, { explicitReload: true, expectedPanel: panel });
+  }
   async setKey() {
+    const panel = this.panel;
     await this.ensureCompatible(true);
+    if (this.panel !== panel) return;
     const value = await this.v.window.showInputBox({
       title: tr("BYOK · 录入 API Key", "BYOK · Enter API Key"), password: true, ignoreFocusOut: true,
       prompt: tr("只在内存中暂存；点击“备份并写入”后交给 VS Code 原生密钥服务。不要输入 ${input:...} 引用。", "Held in memory until Save with Backup transfers it to VS Code secret storage. Do not enter a ${input:...} reference."),
       validateInput: value => !value.trim() ? tr("API Key 不能为空。", "API key cannot be empty.") : /[\r\n]/.test(value.trim()) ? tr("API Key 不能包含换行。", "API key cannot contain line breaks.") : value.trim().startsWith('${') ? tr("请填写真实密钥，不是变量引用。", "Enter the actual API key, not a variable reference.") : undefined
     });
-    if (value === undefined) return;
+    if (value === undefined || this.panel !== panel) return;
     this.pendingKey = value.trim(); await this.post({ type: 'key', pending: true });
     await this.notice(tr("API Key 已暂存于本窗口内存，尚未写入。关闭助手或切换模型组会清除。", "API key is held in memory and is not saved. Closing this editor or switching groups clears it."));
   }
@@ -241,6 +322,65 @@ class ByokTool {
     if (!uri) return;
     await this.v.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(core.sanitizePreset(group), null, 2) + '\n', 'utf8'));
     await this.notice(tr("预设已导出。API Key、密钥引用与全部 requestHeaders 均未包含；其他自定义业务字段请在分享前自行检查。", "Preset exported without API keys, secret references or requestHeaders. Review other custom fields before sharing."), 'success');
+  }
+  async discoverModels(form, panel) {
+    const assertAllowed = () => assertWorkspaceAllowed({ trusted: this.v.workspace.isTrusted,
+      desktop: this.v.env.uiKind === this.v.UIKind.Desktop, aiDisabled: this.v.workspace.getConfiguration().get('chat.disableAIFeatures') === true });
+    assertAllowed();
+    if (!['chat-completions', 'responses'].includes(form?.apiType)) throw new Error(tr('模型发现仅支持 Chat Completions 和 Responses。', 'Model discovery supports Chat Completions and Responses only.'));
+    if (typeof form.noAuth !== 'boolean') throw new Error(tr('请选择是否使用 API Key。', 'Choose whether to use an API key.'));
+    const { root, ids } = discoveryDraft(form.modelsText);
+    const discovery = this.discovery;
+    const url = discovery.modelsUrl(form.defaultUrl);
+    let key = form.noAuth ? undefined : this.pendingKey;
+    const action = tr('发送请求', 'Send Request');
+    const credential = form.noAuth ? tr('不发送 API Key 或 Authorization 请求头。', 'No API key or Authorization header will be sent.')
+      : key !== undefined ? tr('将使用暂存的 API Key 发送 Authorization: Bearer 请求头。', 'The pending API key will be sent in an Authorization: Bearer header.')
+      : tr('将通过密码框询问一次性 API Key，并通过 Authorization: Bearer 请求头发送。不会保存密钥或读取密钥库。', 'You will be prompted for a one-time API key to send in an Authorization: Bearer header. It will not be saved; stored keys are not read.');
+    const controller = new AbortController();
+    const prompts = this.v.CancellationTokenSource ? new this.v.CancellationTokenSource() : undefined;
+    const disposed = panel.onDidDispose(() => { controller.abort(); prompts?.cancel(); });
+    const current = () => this.panel === panel && !controller.signal.aborted;
+    try {
+      const confirm = await this.v.window.showWarningMessage(tr('从此地址发现模型？', 'Discover models at this address?'), {
+        modal: true, detail: `GET ${url}\n\n${credential}`
+      }, action);
+      if (!current() || confirm !== action) return;
+      if (!form.noAuth) {
+        if (key === undefined) {
+          key = await this.v.window.showInputBox({ title: tr('模型发现 · 一次性 API Key', 'Model discovery · One-time API key'),
+            prompt: `GET ${url}`, password: true, ignoreFocusOut: true, validateInput: invalidDiscoveryKey }, prompts?.token);
+          if (!current() || key === undefined) return;
+        }
+        const problem = invalidDiscoveryKey(key);
+        if (problem) throw new Error(problem);
+        key = key.trim();
+      }
+      assertAllowed();
+      let models;
+      try { models = await discovery.fetchModels(url, key, { signal: controller.signal }); }
+      catch (error) {
+        if (!current()) return;
+        if (error instanceof modelDiscovery.DiscoveryError) throw new Error(core.safeError(error, [key]));
+        throw new Error(tr('无法获取模型列表。请检查地址、认证方式和网络连接。草稿未更改。', 'Could not fetch the model list. Check the address, authentication and connection. The draft was not changed.'));
+      }
+      if (!current()) return;
+      const choices = [], candidates = new Map();
+      for (const model of models) {
+        // Never present a server-reflected credential, even inside a valid ID or name.
+        if (ids.has(model.id) || candidates.has(model.id) || (key && Object.values(model).some(v => typeof v === 'string' && v.includes(key)))) continue;
+        candidates.set(model.id, model);
+        choices.push({ label: model.id, description: model.name === model.id ? undefined : model.name });
+      }
+      if (!choices.length) { await this.notice(tr('未找到可追加的新模型。草稿未更改。', 'No new models to append. The draft was not changed.')); return; }
+      const selection = await this.v.window.showQuickPick(choices, { canPickMany: true, title: tr('选择要追加到草稿的模型', 'Select models to append to the draft') }, prompts?.token);
+      if (!current() || !selection?.length) return;
+      assertAllowed();
+      const selected = selection.map(item => candidates.get(item.label));
+      if (root.value.length + selected.length > 300) throw new Error(tr('追加后将超过 300 个模型。请减少选择；草稿未更改。', 'The result would exceed 300 models. Select fewer models; the draft was not changed.'));
+      const delivered = await this.post({ type: 'models', text: appendDraftModels(form.modelsText, root, selected) });
+      if (delivered !== false && current()) await this.notice(tr('所选模型已追加到草稿，尚未保存。请根据供应商文档核对或补填 contextWindow 或 maxInputTokens、maxOutputTokens，以及 toolCalling 和 vision。未返回的参数不会被猜测。', 'Selected models were added to the draft, not saved. Check the provider documentation and fill in missing contextWindow or maxInputTokens, maxOutputTokens, toolCalling, and vision. Unreported values were not guessed.'));
+    } finally { disposed.dispose(); prompts?.dispose(); }
   }
   async addModels(message) {
     const models = parseDocument(message.modelsText).value;

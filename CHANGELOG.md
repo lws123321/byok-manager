@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.1
+
+- Replaced the Activity Bar icon with a horizontal, single-color key. The Marketplace logo is unchanged.
+
+## 0.8.0
+
+- The model list is the main view for saved groups. Connection settings open on demand and are expanded for new groups.
+- Search, fetch and add models from a single toolbar. Secondary tools, reasoning levels, row actions, settings and diagnostics are available on demand. Saving still requires explicit confirmation.
+
+## 0.7.1
+
+- Switch between saved model groups using VS Code’s searchable picker. Cancelling keeps the draft and its pending key.
+- The API Key row now distinguishes a reusable local reference, a pending replacement and an unauthenticated endpoint. Editing the group name updates the credential summary before saving.
+
+## 0.7.0
+
+- Both editions can discover models for Responses and Chat Completions endpoints. Confirm the destination before a single model-list `GET`, then choose models to add to the draft. An optional key for that request is not saved. Edit unreported limits and capabilities manually; validation remains local.
+
 ## 0.6.0
 
 - A single release version now builds two editions from the same manager, secret handling, backup logic and walkthrough framework. Public keeps the existing Marketplace identity, generic defaults and user-selected auxiliary model.

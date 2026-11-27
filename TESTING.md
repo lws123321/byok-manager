@@ -1,5 +1,17 @@
 # Testing / 测试
 
+## Models-first preview (0.8.0)
+
+The browser smoke checks existing vs new connection disclosure, the model tools and row actions, and keyboard access to reasoning levels. `node test/browser-smoke.js --screenshots` captures the complete existing-group screen in the two provider guide PNGs using fictional data. No credentials or provider calls are required.
+
+## Provider controls (0.7.1)
+
+In the model manager, use the keyboard to open **Switch Group…**. Check that the native picker lists saved Custom Endpoint groups (not a duplicate New action) and marks the current group. Cancel the picker or its discard prompt; the group, unsaved edits and pending credential should be unchanged. Rename the draft to a group with or without a local reference, enter and clear a pending key, and toggle unauthenticated mode. The key row describes what a save would use, not whether a credential works. Use synthetic groups rather than screenshots of a production profile for documentation.
+
+## Model discovery (0.7.0)
+
+Run `node --test test/discovery.test.js test/extension.test.js test/webview.test.js`. The transport tests exercise OpenAI-style lists and failure handling; the host integration also makes a real GET to a temporary loopback server using a synthetic one-time key and a simulated native picker. Check that cancelling before the request sends nothing, existing IDs are skipped, and the result remains a draft with unknown limits left blank. A cancellation at the picker discards the selection, not the request that already occurred. No external service or real key is needed for these tests.
+
 ## Edition acceptance (0.6.0)
 
 With the official CLI installed, `npm test` also verifies the raw checkout packaging guard: `vsce ls --no-dependencies` must expose only the root manifest and README, and direct packaging must fail without creating a VSIX. The test uses synthetic private inputs and an existing internal artifact. `npm run package:marketplace` is the separate, supported positive path.
@@ -44,14 +56,14 @@ In the installed Public VSIX, the Command Palette reopened the guide twice. With
 
 Repeat in English and Simplified Chinese. Open the guide twice, follow **Open Model Manager**, and check the three illustrated operations: provider setup, model editing and saving. Confirm that reading a step, opening the editor, cancelling a save or receiving a validation error is not presented as a successful configuration write. A successful save is not evidence of a successful provider request.
 
-To exercise the packaged guide on Windows, set `PLAYWRIGHT_CORE_PATH` as above and run `node test/install-onboarding.js dist/public/asong-dev.byok-manager-0.6.0.vsix dist/asong-dev.byok-manager-0.5.1.vsix`. Both files must have the same publisher. Set `BYOK_ZH_PACK` to a local Simplified Chinese language pack directory to include desktop language verification. This uses separate temporary profiles, not the user's normal VS Code window.
+To exercise the packaged guide on Windows, set `PLAYWRIGHT_CORE_PATH` as above and run `node test/install-onboarding.js dist/public/asong-dev.byok-manager-0.8.0.vsix dist/public/asong-dev.byok-manager-0.7.1.vsix`. Both files must have the same publisher. Set `BYOK_ZH_PACK` to a local Simplified Chinese language pack directory to include desktop language verification. This uses separate temporary profiles, not the user's normal VS Code window.
 
 ## Release candidate
 
 Use `npm run package:marketplace` with the same release publisher as the previous public VSIX (see `RELEASE.md`). Check the final archive, not just the staging folder:
 
 ```sh
-python test/verify_vsix.py dist/marketplace/asong-dev.byok-manager-0.6.0.vsix asong-dev.byok-manager 0.6.0 --repository https://github.com/lws123321/byok-manager
+python test/verify_vsix.py dist/marketplace/asong-dev.byok-manager-0.8.0.vsix asong-dev.byok-manager 0.8.0 --repository https://github.com/lws123321/byok-manager
 ```
 
 `test/verify_vsix.py` is a compatibility CLI for the Node verifier; run it from a checkout matching the candidate version. For a local package use its path in `dist/public/` or `dist/enterprise/` and omit `--repository` unless the manifest actually has that release override. Enterprise comparison needs the matching private input. The verifier never installs, executes or publishes the archive.
